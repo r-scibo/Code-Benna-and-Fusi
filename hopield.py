@@ -50,8 +50,11 @@ class HopfieldNetwork:
             if initial_J != None:
                 raise Exception("Initial J not implemented for BfLin")
             else:
-                self.J_matrix = BfMatrix(N, syn_specs["m"], syn_specs["levels"], syn_specs["alpha"], syn_specs["decreasing_levels"], syn_specs["beta"])
+                self.J_matrix = BfSynapsesVectorized(N, syn_specs["m"], syn_specs["levels"], 
+                                                    syn_specs["alpha"], syn_specs["decreasing_levels"], 
+                                                    syn_specs["beta"])
                 self.J = self.J_matrix.get_J()
+
 
             
         # Number of memories stored
@@ -192,173 +195,79 @@ def store_k_memories(Network, k, f=0.5):
     
     return memories
 
-
-class BfMatrix:
-    '''
-    Holder for the Benna and Fusi synapses in matrix form
-
-    Methods
-    ______________
-    update:
-        - Inputs: input matrix to update the synapses
-        - Updates the synapses as desribed in Benna and Fusi 2016
-    get_J:
-        - Returns the synaptic efficacy matrix J as a numpy array
-    '''
-
-    def __init__ (self, N, m, levels, alpha=0.25, decreasing_levels=True, beta=2):
-        '''
-        Inputs:
-            - N: number of neurons
-            - m: number of interal varibales
-            - levels: number of levels for the internal variables
-            - alpha: controls the overall timescale of the dynamics
-            - decreasing_levels: if True, the number of levels decreases from
-              'levels' for first variable to two for last
-        '''
-
+        
+class BfSynapsesVectorized:
+    def __init__(self, N, m, levels, alpha=0.25, decreasing_levels=True, beta=2):
         self.N = N
         self.m = m
-        self.levels = levels
         self.alpha = alpha
-        self.decreasing_levels = decreasing_levels
-        self.b = beta
+        self.beta = beta
 
-        self.J_matrix = [[BfSynapseLinear(m, levels, alpha, decreasing_levels, beta) for _ in range(N)] for _ in range(N)]
+        # The 3D synaptic state: shape (N, N, m)
+        self.u = np.zeros((N, N, m))
 
-    def update(self, input_matrix):
-        '''
-        Inputs:
-            - input_matrix: matrix of inputs to update the synapses
-        '''
-        if input_matrix.shape != (self.N, self.N):
-            raise Exception("Input matrix is not in correct shape or format")
+        # Precompute g couplings
+        self.g = np.array([beta ** (-2*i + 1) * alpha for i in range(m-1)])
 
-        for i in range(self.N):
-            for j in range(self.N):
-                self.J_matrix[i][j].update(input_matrix[i][j])
-
-    def get_J(self):
-        '''
-        Returns the synaptic matrix J as a numpy array
-        '''
-        J = np.zeros((self.N, self.N))
-        for i in range(self.N):
-            for j in range(self.N):
-                J[i][j] = self.J_matrix[i][j].u[0]
-
-        return J
-    
-    def print_internal_vars(self):
-        arrays = np.zeros((self.m, self.N*self.N))
-        for i in range(self.m):
-            for j in range(self.N):
-                for k in range(self.N):
-                    arrays[i][j*self.N + k] = self.J_matrix[j][k].u[i]
-
-        fig, axes = plt.subplots(self.m, 1, figsize=(8, 4 * self.m), constrained_layout=True)
-
-        # Plot each histogram
-        for idx, arr in enumerate(arrays, start=1):
-            ax = axes[idx - 1]
-            ax.hist(arr, bins='auto', edgecolor='black')
-            ax.set_title(f"Values of internal variable {idx}")
-            ax.set_xlabel("Value")
-            ax.set_ylabel("Frequency")
-        
-        plt.show()
-    
-
-
-
-class BfSynapseLinear:
-    '''
-    Methods
-    ______________
-    update:
-        - Inputs: modification of synapstic weight coming from update rule (es. Hebb)
-        - Updates the synapse as desribed in Benna and Fusi 2016
-
-    '''
-
-    def __init__(self, m, levels, alpha=0.25, decreasing_levels=True, beta = 2):
-        '''
-        Inputs:
-            - m: number of interal varibales
-            - levels: number of levels for the internal variables
-            - alpha: controls the overall timescale of the dynamics
-            - decreasing_levels: if True, the number of levels decreases from
-              'levels' for first variable to two for last
-        '''
-
-        self.m = m   # Number of internal variables
-        self.alpha = alpha
-        self.b = beta
-
-        # Create and initialize internal variables
-        self.u = np.zeros((m,))
-
-        self.levels = {i: None for i in range(m)}
-
-        if decreasing_levels == False:
-            base = levels/2
-            for i in range(m):
-                self.levels[i] = np.arange(-base, base+1, 1)
-        # Decreasing levels: from 'levels' for first vaeriable to two for last
-        else:
-            for i in range(m):
-                slope = (1-levels)/(m-1)
-                height = math.ceil(slope*i + levels)
-                base = height/2
-
-                self.levels[i] = np.arange(-base, base+1, 1)
-
-        self.g = np.zeros((m-1,))  # Weights of internal connections = g_(i,i+1) / C_i
-        for i in range(m-1):
-            self.g[i] = self.b**(-2*i +1)*alpha
-
-
-    def update(self, input):
-
-        u_copy = self.u.copy()
-
-        # Update internal variables in continuous way
-        for i in range(self.m):
-
-            if i == 0:
-                self.u[i] = u_copy[i] + input + self.g[i]*(u_copy[i+1] - u_copy[i])
-            elif i == self.m - 1:
-                self.u[i] = u_copy[i] + self.g[i-1]*(u_copy[i-1] - u_copy[i]) + 0
+        # Compute levels per internal variable
+        self.levels = []
+        for i in range(m):
+            if decreasing_levels:
+                slope = (1 - levels) / (m - 1)
+                height = math.ceil(slope * i + levels)
+                base = height / 2
+                lv = np.arange(-base, base + 1, 1)
             else:
-                self.u[i] = u_copy[i] + self.g[i-1]*(u_copy[i-1] - u_copy[i]) + self.g[i]*(u_copy[i+1] - u_copy[i])
-
-         # Stochastic discretization
-        for i in range(self.m):
-            self.u[i] = self._snap_stochastic(self.u[i], self.levels[i])
-
-    @staticmethod
-    def _snap_stochastic(u, levels):
+                base = levels / 2
+                lv = np.arange(-base, base + 1, 1)
+            self.levels.append(lv)
+    
+    def update(self, delta_J):
         '''
-        Stochastically map a scalar u onto the sorted 1D array levels:
-          - If u < levels[0], return levels[0]
-          - If u > levels[-1], return levels[-1]
-          - Otherwise, find lower<=u<=upper and pick lower with probability
-            p = |u - upper| / (|u - upper| + |u - lower|)
+        Fully vectorized update over all synapses (N x N) at once
+        delta_J: numpy array of shape (N, N)
+        '''
+        u_copy = self.u.copy()
+        m = self.m
+
+        # Level 0 update (input term + coupling to level 1)
+        self.u[:, :, 0] = u_copy[:, :, 0] + delta_J + self.g[0] * (u_copy[:, :, 1] - u_copy[:, :, 0])
+
+        # Internal levels 1 to m-2
+        for i in range(1, m - 1):
+            self.u[:, :, i] = (u_copy[:, :, i] 
+                                + self.g[i-1] * (u_copy[:, :, i-1] - u_copy[:, :, i]) 
+                                + self.g[i] * (u_copy[:, :, i+1] - u_copy[:, :, i]))
+
+        # Last level m-1 (only coupling to m-2)
+        self.u[:, :, m - 1] = u_copy[:, :, m - 1] + self.g[m-2] * (u_copy[:, :, m-2] - u_copy[:, :, m-1])
+
+        # Stochastic discretization vectorized
+        for i in range(m):
+            self.u[:, :, i] = self.snap_stochastic_vectorized(self.u[:, :, i], self.levels[i])
+    
+    def get_J(self):
+        return self.u[:, :, 0].copy()
+
+    def snap_stochastic_vectorized(self, u_arr, levels):
+        '''
+        Fully vectorized stochastic discretization.
         '''
         levels = np.asarray(levels)
-        if u <= levels[0]:
-            return levels[0]
-        if u >= levels[-1]:
-            return levels[-1]
-        idx = np.searchsorted(levels, u, side='right')
-        lower = levels[idx - 1]
-        upper = levels[idx]
-        d_low = abs(u - lower)
-        d_high = abs(upper - u)
-        p_lower = d_high / (d_high + d_low)
-        return lower if np.random.rand() < p_lower else upper
+        u_arr = np.clip(u_arr, levels[0], levels[-1])
+        idx = np.searchsorted(levels, u_arr, side='right')
 
-        
+        lower = levels[np.maximum(idx - 1, 0)]
+        upper = levels[np.minimum(idx, len(levels) - 1)]
+
+        d_low = np.abs(u_arr - lower)
+        d_high = np.abs(upper - u_arr)
+        p_lower = d_high / (d_high + d_low)
+
+        random_draws = np.random.rand(*u_arr.shape)
+        snapped = np.where(random_draws < p_lower, lower, upper)
+
+        return snapped
 
                 
 
@@ -376,7 +285,7 @@ import time
 start = time.perf_counter()
 
 # Number of neurons
-neurons = 1000
+neurons =30000
 # Number of evolution runs
 runs = 20
 # Total memories stored before running
