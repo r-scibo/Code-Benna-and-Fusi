@@ -3,6 +3,12 @@ import numpy as np
 import matplotlib 
 from matplotlib import pyplot as plt
 import math
+from numba import njit, prange
+
+# Everytime I run
+# cd ~/path/to/Code-Benna-and-Fusi
+# source bf_env/bin/activate
+
 
 # First try an implmentation of basic hopfield model
 
@@ -32,6 +38,7 @@ class HopfieldNetwork:
             - synapse_type: type of synapse you want it to have. Possibilities:
                 - None: basic hebbian synapse
                 - "BfLin": Benna and Fusi 2016 synapse linear 
+                - "Wdecay": Hebbian synapse with decay parameter Jij(t+1) = par1*Jij(t) + par2*epsi*epsj
             - syn_specs: disctionary with the parameters needed for each type of synapse
         '''
         
@@ -44,16 +51,24 @@ class HopfieldNetwork:
         # Initial synapse matrix
         if synapse_type == None:
             if initial_J == None:
-                self.J = np.zeros((N,N), dtype=np.float64)
+                self.J = np.zeros((N,N), dtype=np.float32)
 
         if synapse_type == "BfLin":
             if initial_J != None:
                 raise Exception("Initial J not implemented for BfLin")
             else:
-                self.J_matrix = BfSynapsesVectorized(N, syn_specs["m"], syn_specs["levels"], 
-                                                    syn_specs["alpha"], syn_specs["decreasing_levels"], 
-                                                    syn_specs["beta"])
+                self.J_matrix = BfSynapsesNumba(N, syn_specs["bf_m"], syn_specs["bf_levels"], 
+                                                    syn_specs["bf_alpha"], syn_specs["bf_decreasing_levels"], 
+                                                    syn_specs["bf_beta"], parallel=True)
                 self.J = self.J_matrix.get_J()
+
+        if synapse_type == "Wdacay":
+            self.hebb_lambda = syn_specs["hebb_lambda"]
+            self.hebb_alpha = syn_specs["hebb_alpha"]
+            if initial_J != None:
+                raise Exception("Initial J not implemented for BfLin")
+            else:
+                self.J = np.zeros((N,N), dtype=np.float32)
 
 
             
@@ -73,6 +88,11 @@ class HopfieldNetwork:
             delta_J = basic_hebb_not_normalized(memory)
             self.J_matrix.update(delta_J)
             self.J = self.J_matrix.get_J()
+
+        if self.synapse_type == "Wdacay":
+            delta_J = basic_hebb(self, memory, self.hebb_alpha)
+            self.J = self.hebb_lambda * self.J + delta_J
+
             
         
         self.p += 1
@@ -143,12 +163,15 @@ class HopfieldNetwork:
     
         
            
-def basic_hebb(Network, memory):
+def basic_hebb(Network, memory, alpha=1):
     '''
     Implements basic hebbian synaptic rule for hopfield model
     '''
+    delta = np.outer(memory, memory).astype(np.float32) / Network.N
 
-    delta = np.outer(memory, memory) / Network.N
+    if alpha != 1:
+        delta = delta*alpha
+
     np.fill_diagonal(delta, 0)
     return delta
 
@@ -157,7 +180,7 @@ def basic_hebb_not_normalized(memory):
     Implements basic hebbian synaptic rule for hopfield model without normalizing by N
     '''
 
-    delta = np.outer(memory, memory)
+    delta = np.outer(memory, memory).astype(np.float32)
     np.fill_diagonal(delta, 0)
     return delta
 
@@ -171,13 +194,13 @@ def store_k_memories(Network, k, f=0.5):
         Ignored if sparse=False. Default is 0.5.
     '''
     N = Network.N
-    memories = np.zeros((k, N))
+    memories = np.zeros((k, N), dtype=np.float32)
     
     for i in range(k):
         
         if f == 0.5:
             # classical dense coding: each neuron ±1 with equal probability
-            pattern = np.random.choice([-1, +1], size=N)
+            pattern = np.random.choice([-1, +1], size=N).astype(np.float32)
         
         else:
             # sparse coding: exactly f*N active (+1), rest -1
@@ -196,81 +219,159 @@ def store_k_memories(Network, k, f=0.5):
     return memories
 
         
-class BfSynapsesVectorized:
-    def __init__(self, N, m, levels, alpha=0.25, decreasing_levels=True, beta=2):
+class BfSynapsesNumba:
+    """
+    Optimized Benna & Fusi Synapse model with Numba kernel.
+    Can run either in serial or parallel mode.
+    """
+
+    def __init__(self, N, m, levels, alpha=0.25, decreasing_levels=True, beta=2, parallel=False):
         self.N = N
         self.m = m
         self.alpha = alpha
         self.beta = beta
+        self.parallel = parallel  # If True, uses parallel update kernel
 
-        # The 3D synaptic state: shape (N, N, m)
-        self.u = np.zeros((N, N, m))
+        self.u = np.zeros((N, N, m), dtype=np.float32)
+        self.g = np.array([beta ** (-2 * i + 1) * alpha for i in range(m-1)], dtype=np.float32)
 
-        # Precompute g couplings
-        self.g = np.array([beta ** (-2*i + 1) * alpha for i in range(m-1)])
-
-        # Compute levels per internal variable
-        self.levels = []
+        # Build levels for each internal variable (heterogeneous)
+        self.levels_list = []
         for i in range(m):
             if decreasing_levels:
                 slope = (1 - levels) / (m - 1)
                 height = math.ceil(slope * i + levels)
                 base = height / 2
-                lv = np.arange(-base, base + 1, 1)
+                lv = np.arange(-base, base + 1, 1).astype(np.float32)
             else:
                 base = levels / 2
-                lv = np.arange(-base, base + 1, 1)
-            self.levels.append(lv)
-    
-    def update(self, delta_J):
-        '''
-        Fully vectorized update over all synapses (N x N) at once
-        delta_J: numpy array of shape (N, N)
-        '''
-        u_copy = self.u.copy()
-        m = self.m
+                lv = np.arange(-base, base + 1, 1).astype(np.float32)
+            self.levels_list.append(lv)
 
-        # Level 0 update (input term + coupling to level 1)
-        self.u[:, :, 0] = u_copy[:, :, 0] + delta_J + self.g[0] * (u_copy[:, :, 1] - u_copy[:, :, 0])
+        # Pad levels into rectangular array for Numba compatibility
+        self.max_levels = max(len(lv) for lv in self.levels_list)
+        self.levels_array = np.full((m, self.max_levels), 0.0, dtype=np.float32)
+        self.levels_len = np.zeros(m, dtype=np.int32)
 
-        # Internal levels 1 to m-2
-        for i in range(1, m - 1):
-            self.u[:, :, i] = (u_copy[:, :, i] 
-                                + self.g[i-1] * (u_copy[:, :, i-1] - u_copy[:, :, i]) 
-                                + self.g[i] * (u_copy[:, :, i+1] - u_copy[:, :, i]))
-
-        # Last level m-1 (only coupling to m-2)
-        self.u[:, :, m - 1] = u_copy[:, :, m - 1] + self.g[m-2] * (u_copy[:, :, m-2] - u_copy[:, :, m-1])
-
-        # Stochastic discretization vectorized
         for i in range(m):
-            self.u[:, :, i] = self.snap_stochastic_vectorized(self.u[:, :, i], self.levels[i])
-    
+            n_lv = len(self.levels_list[i])
+            self.levels_array[i, :n_lv] = self.levels_list[i]
+            self.levels_len[i] = n_lv
+
+    def update(self, delta_J):
+        """
+        Update synapses using the precompiled Numba kernel.
+        """
+        if self.parallel:
+            bf_update_parallel(self.u, delta_J, self.g, self.levels_array, self.levels_len)
+        else:
+            bf_update(self.u, delta_J, self.g, self.levels_array, self.levels_len)
+
     def get_J(self):
+        """
+        Extract current effective synaptic matrix (first internal variable).
+        """
         return self.u[:, :, 0].copy()
 
-    def snap_stochastic_vectorized(self, u_arr, levels):
-        '''
-        Fully vectorized stochastic discretization.
-        '''
-        levels = np.asarray(levels)
-        u_arr = np.clip(u_arr, levels[0], levels[-1])
-        idx = np.searchsorted(levels, u_arr, side='right')
-
-        lower = levels[np.maximum(idx - 1, 0)]
-        upper = levels[np.minimum(idx, len(levels) - 1)]
-
-        d_low = np.abs(u_arr - lower)
-        d_high = np.abs(upper - u_arr)
-        p_lower = d_high / (d_high + d_low)
-
-        random_draws = np.random.rand(*u_arr.shape)
-        snapped = np.where(random_draws < p_lower, lower, upper)
-
-        return snapped
-
                 
+@njit
+def snap(u, levels_row, n_levels):
+    """
+    Stochastic snapping of a single internal variable u to its allowed levels.
+    """
+    # Clip if outside allowed range
+    if u <= levels_row[0]:
+        return levels_row[0]
+    if u >= levels_row[n_levels - 1]:
+        return levels_row[n_levels - 1]
 
+    # Search the correct bin
+    for idx in range(1, n_levels):
+        if u < levels_row[idx]:
+            lower = levels_row[idx - 1]
+            upper = levels_row[idx]
+
+            # Compute stochastic snapping probability
+            d_low = abs(u - lower)
+            d_high = abs(upper - u)
+            p_lower = d_high / (d_high + d_low)
+
+            return lower if np.random.rand() < p_lower else upper
+
+    # Safety fallback (should not reach here)
+    return levels_row[n_levels - 1]
+
+
+# ===========================================================
+# NUMBA-COMPILED SERIAL UPDATE FUNCTION (NO PARALLELIZATION)
+# ===========================================================
+
+@njit
+def bf_update(u, delta_J, g, levels_array, levels_len):
+    """
+    Core Benna & Fusi update rule — serial version.
+    u: synapse state array, shape (N, N, m)
+    delta_J: Hebbian input, shape (N, N)
+    g: coupling constants, shape (m-1,)
+    levels_array: allowed levels, shape (m, max_levels)
+    levels_len: number of levels per internal variable, shape (m,)
+    """
+    N, _, m = u.shape
+    u_copy = u.copy()
+
+    for i in range(N):
+        for j in range(N):
+
+            # Update fast variable (k = 0)
+            u[i, j, 0] = u_copy[i, j, 0] + delta_J[i, j] + g[0] * (u_copy[i, j, 1] - u_copy[i, j, 0])
+
+            # Update intermediate variables (k = 1 to m-2)
+            for k in range(1, m-1):
+                u[i, j, k] = (u_copy[i, j, k] 
+                              + g[k-1] * (u_copy[i, j, k-1] - u_copy[i, j, k]) 
+                              + g[k] * (u_copy[i, j, k+1] - u_copy[i, j, k]))
+
+            # Update slowest variable (k = m-1)
+            u[i, j, m-1] = (u_copy[i, j, m-1] 
+                            + g[m-2] * (u_copy[i, j, m-2] - u_copy[i, j, m-1]))
+
+            # Stochastic snapping for all m internal variables
+            for k in range(m):
+                levels_row = levels_array[k, :]
+                n_levels = levels_len[k]
+                u[i, j, k] = snap(u[i, j, k], levels_row, n_levels)
+
+
+# ===========================================================
+# NUMBA-COMPILED PARALLEL UPDATE FUNCTION (WITH PARALLELIZATION)
+# ===========================================================
+
+@njit(parallel=True)
+def bf_update_parallel(u, delta_J, g, levels_array, levels_len):
+    """
+    Same update rule as above, but fully parallelized across synapses.
+    """
+    N, _, m = u.shape
+    u_copy = u.copy()
+
+    for idx in prange(N * N):  # parallel loop across all synapses
+        i = idx // N
+        j = idx % N
+
+        u[i, j, 0] = u_copy[i, j, 0] + delta_J[i, j] + g[0] * (u_copy[i, j, 1] - u_copy[i, j, 0])
+
+        for k in range(1, m-1):
+            u[i, j, k] = (u_copy[i, j, k] 
+                          + g[k-1] * (u_copy[i, j, k-1] - u_copy[i, j, k]) 
+                          + g[k] * (u_copy[i, j, k+1] - u_copy[i, j, k]))
+
+        u[i, j, m-1] = (u_copy[i, j, m-1] 
+                        + g[m-2] * (u_copy[i, j, m-2] - u_copy[i, j, m-1]))
+
+        for k in range(m):
+            levels_row = levels_array[k, :]
+            n_levels = levels_len[k]
+            u[i, j, k] = snap(u[i, j, k], levels_row, n_levels)
 
 
 
@@ -285,15 +386,15 @@ import time
 start = time.perf_counter()
 
 # Number of neurons
-neurons =30000
+neurons = 20000
 # Number of evolution runs
-runs = 20
+runs = 10
 # Total memories stored before running
 tot_mem_stored = 1
 # Memory we want to test the overlap with
 test = 0
 
-syn_specs1 = {"m": 4, "levels": 30, "alpha": 0.25, "decreasing_levels": False, "beta": 2}
+syn_specs1 = {"bf_m": 4, "bf_levels": 30, "bf_alpha": 0.25, "bf_decreasing_levels": False, "bf_beta": 2}
 
 Network1 = HopfieldNetwork(neurons, synapse_type = "BfLin", syn_specs = syn_specs1)
 mems = store_k_memories(Network1, tot_mem_stored)
@@ -318,7 +419,7 @@ print(f"Elapsed: {end - start:.4f} seconds")
 
 # Plot from Benna and Fusi hopfield network
 
-def overlap_in_time_plot(cat_forgetting, N, n_mem, time, noise, n_sweeps, synapse_type = None, m = 4, levels = 35, alpha=0.25, decreasing_levels=True, beta =2):
+def overlap_in_time_plot(cat_forgetting, synapse_type, N, n_mem, time, noise, n_sweeps, syn_specs):
     '''
     Inputs:
         - cat_forgetting: 
@@ -343,7 +444,7 @@ def overlap_in_time_plot(cat_forgetting, N, n_mem, time, noise, n_sweeps, synaps
     for j in range(n_mem):
         
         # Create a network
-        Net = HopfieldNetwork(N, synapse_type, m, levels, alpha, decreasing_levels, beta =2)
+        Net = HopfieldNetwork(N, synapse_type, syn_specs)
         
         # Initialize where to store memories
         memories = np.zeros((time, Net.N))
@@ -416,10 +517,10 @@ def overlap_in_time_plot(cat_forgetting, N, n_mem, time, noise, n_sweeps, synaps
     plt.title(f"Overlap vs. memory index  (blue: ε=0, red: ε={noise:.2f})")
     plt.show()
         
+syn_specs2 = {"bf_m" : 4, "bf_levels" : 35, "bf_alpha" : 0.25, "bf_decreasing_levels" : True, "bf_beta": 2}
 
-overlap_in_time_plot(cat_forgetting = True, N = 100, n_mem = 2, time = 800, noise = 0.25, n_sweeps = 20, 
-                     synapse_type = "BfLin", m = 4, levels = 20, alpha=0.25, 
-                     decreasing_levels=True, beta =2)
+overlap_in_time_plot(cat_forgetting = False, synapse_type="BfLin", N = 1000, n_mem = 2, time = 200, noise = 0.25, n_sweeps = 10, 
+                     syn_specs = syn_specs2)
 
 
 # %%
