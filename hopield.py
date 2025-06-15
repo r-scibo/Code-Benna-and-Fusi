@@ -432,13 +432,13 @@ import time
 start = time.perf_counter()
 
 # Number of neurons
-neurons = 1000
+neurons = 100
 # Number of evolution runs
 runs = 10
 # Total memories stored before running
-tot_mem_stored = 1000
+tot_mem_stored = 100
 # Memory we want to test the overlap with
-test = 999
+test = 99
 
 syn_specs1 = {"bf_m": 4, "bf_levels": 30, "bf_alpha": 0.25, "bf_decreasing_levels": True, "bf_beta": 2}
 syn_specsW = {"hebb_lambda" : 0.98, "hebb_alpha" : 4}
@@ -449,12 +449,12 @@ Network1.init_at_memory(mems[test], 0.0)
 
 overlaps = np.zeros((runs,))
 for i in range(runs):
-    Network1.run_async(1)
+    Network1.run_async(1, binarized = True)
     overlaps[i] = Network1.overlap(mems[test])
     
 plt.plot(np.arange(0,runs), overlaps)
 
-Network1.plot_weight_distribution()
+# Network1.plot_weight_distribution()
 
 end = time.perf_counter()
 print(f"Elapsed: {end - start:.4f} seconds")
@@ -465,7 +465,7 @@ print(f"Elapsed: {end - start:.4f} seconds")
 
 # Plot from Benna and Fusi hopfield network
 
-def overlap_in_time_plot(cat_forgetting, synapse_type, N, n_mem, time, noise, n_sweeps, syn_specs, show_plot = True):
+def overlap_in_time_plot(cat_forgetting, synapse_type, N, n_mem, time, noise, n_sweeps, syn_specs, binarized, show_plot = True):
     '''
     Inputs:
         - cat_forgetting: 
@@ -513,7 +513,7 @@ def overlap_in_time_plot(cat_forgetting, synapse_type, N, n_mem, time, noise, n_
 
             # Calculate overlap for uncorrupted cue
             Net.init_at_memory(memories[y])
-            Net.run_async(n_sweeps)
+            Net.run_async(n_sweeps, binarized)
             overlaps_standard[j,i] = Net.overlap(memories[y])
             
             # Calculate overlap for noisy cue
@@ -572,7 +572,7 @@ syn_specs2 = {"bf_m" : 4, "bf_levels" : 35, "bf_alpha" : 0.25, "bf_decreasing_le
 syn_specs3 = {"hebb_lambda" : 0.99, "hebb_alpha" : 4.0}
 
 hold1, hold2 = overlap_in_time_plot(cat_forgetting = True, synapse_type="Wdecay", N = 500, n_mem = 2, time = 500, noise = 0.25, n_sweeps = 10, 
-                     syn_specs = syn_specs3, show_plot = True)
+                     syn_specs = syn_specs3, binarized = True, show_plot = True)
 
 
 
@@ -581,7 +581,7 @@ hold1, hold2 = overlap_in_time_plot(cat_forgetting = True, synapse_type="Wdecay"
 
 # %% # Calculate max memory lifetime
 
-def mem_lifetime_calc(iterations, synapse_type, N, time, noise, n_sweeps, syn_specs):
+def mem_lifetime_calc(iterations, synapse_type, N, time, noise, n_sweeps, syn_specs, binarized):
     '''
     Calculates the average maximum memory lifetime
     Inputs:
@@ -595,7 +595,7 @@ def mem_lifetime_calc(iterations, synapse_type, N, time, noise, n_sweeps, syn_sp
     for i in range(iterations):
     
         overlaps_standard, overlaps_noise = overlap_in_time_plot(False, synapse_type, N, 1, time, 
-                                                                noise, n_sweeps, syn_specs, False)
+                                                                noise, n_sweeps, syn_specs, binarized, False)
         
         # Create boolean masks
         mask_standard = (overlaps_standard > 0.99).any(axis=0)
@@ -618,7 +618,7 @@ syn_specs2 = {"bf_m" : 4, "bf_levels" : 45, "bf_alpha" : 0.25, "bf_decreasing_le
 syn_specs3 = {"hebb_lambda" : 0.98, "hebb_alpha" : 4.0}
 
 mem_lifetime_calc(10, synapse_type = "BfLin", N = 200, time = 30, noise = 0.25, 
-                  n_sweeps = 10, syn_specs = syn_specs2)
+                  n_sweeps = 10, syn_specs = syn_specs2, binarized = False)
 
 
 
@@ -630,16 +630,10 @@ mem_lifetime_calc(10, synapse_type = "BfLin", N = 200, time = 30, noise = 0.25,
 # Grid search for optimal parameters for Wdecresing synapses, validation metric being max memory lifetime
 # In particular, trying to find optimal hebb_lambda and hebb_alpha
 
-def gridsearch_mem_lifetime(param_ranges, iterations, synapse_type, N, time, noise, n_sweeps, syn_specs, plot_heatmap=True):
+def gridsearch_mem_lifetime(param_ranges, iterations, synapse_type, N, time, noise, n_sweeps, syn_specs, binarized, plot_heatmap=True):
     '''
     Grid search over synapse parameters for memory lifetime.
-
-    Inputs:
-        - param_ranges: dict like {"hebb_lambda": [num_vals, min_val, max_val], ...}
-        - iterations: number of trials for averaging
-        - synapse_type, N, time, noise, n_sweeps: standard params
-        - syn_specs: dictionary template of synapse parameters
-        - plot_heatmap: if True, automatically plots heatmap for 1D/2D searches
+    Returns: results array, grids, best_params_dict
     '''
 
     # Generate grid points
@@ -668,13 +662,23 @@ def gridsearch_mem_lifetime(param_ranges, iterations, synapse_type, N, time, noi
             syn_specs_curr[param] = value
 
         # Compute lifetime for this configuration
-        avg_std, avg_noi = mem_lifetime_calc(iterations, synapse_type, N, time, noise, n_sweeps, syn_specs_curr)
+        avg_std, avg_noi = mem_lifetime_calc(iterations, synapse_type, N, time, noise, n_sweeps, syn_specs_curr, binarized)
 
         # Store result (you can choose avg_std, avg_noi, or a combination)
         it[0] = avg_std
 
         print(f"Params {syn_specs_curr} --> Lifetime {avg_std:.2f}")
         it.iternext()
+
+    # Find best parameters
+    best_idx = np.unravel_index(np.argmax(results), results.shape)
+    best_params = {}
+    for i, param in enumerate(param_names):
+        best_params[param] = mesh[i][best_idx]
+
+    print("\nBest parameters found:")
+    for k, v in best_params.items():
+        print(f"  {k} = {v}")
 
     # Plot heatmap if 1D or 2D grid search
     if plot_heatmap:
@@ -701,17 +705,22 @@ def gridsearch_mem_lifetime(param_ranges, iterations, synapse_type, N, time, noi
         else:
             print("Heatmap plotting supported only for 1D or 2D searches.")
 
-    return results, grids
+    return results, grids, best_params
+
 
 
 param_ranges = {
     "hebb_lambda": [5, 0.95, 0.999],
     "hebb_alpha": [5, 1.0, 10.0]}
 
-results, grids = gridsearch_mem_lifetime(param_ranges, iterations=5,
+results, grids, best_params= gridsearch_mem_lifetime(param_ranges, iterations=5,
                                           synapse_type="Wdecay", N=200, time=70, noise=0.25,
-                                          n_sweeps=10, syn_specs={})
+                                          n_sweeps=10, syn_specs={}, binarized = False, plot_heatmap=True)
+
+print(best_params)
 
 
 
-# %%
+#%%
+
+
