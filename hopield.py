@@ -29,7 +29,6 @@ class HopfieldNetwork:
         - Runs asynchronous dynamics of the network from the current staus
     '''
 
-    # m = 4, levels = 35, alpha=0.25, decreasing_levels=True, beta =2
     def __init__ (self, N, synapse_type = None, syn_specs={}, initial_J = None):
         '''
         Takes as inputs:
@@ -69,45 +68,70 @@ class HopfieldNetwork:
                 raise Exception("Initial J not implemented for BfLin")
             else:
                 self.J = np.zeros((N,N), dtype=np.float32)
-
-
             
         # Number of memories stored
         self.p = 0 
         
-    def store_memory (self, memory):
+    def store_memory (self, memory, f=0.5):
         if memory.shape != (self.N,):
             raise Exception("Memory is not in correct shape or format")
 
-        delta_j = 0
         if self.synapse_type == None:
-            delta_J = basic_hebb(memory, self.N)
-            self.J += np.float64(delta_J)
+            if f == 0.5:
+                delta_J = basic_hebb(memory, self.N)
+                self.J += np.float32(delta_J)
+            else:
+                delta_J = tsodyks_feigelman(memory, self.N, f)
+                self.J += np.float32(delta_J)
 
         if self.synapse_type == "BfLin":
-            delta_J = basic_hebb_not_normalized(memory)
-            self.J_matrix.update(delta_J)
-            self.J = self.J_matrix.get_J()
+            if f == 0.5:
+                delta_J = basic_hebb_not_normalized(memory)
+                self.J_matrix.update(delta_J)
+                self.J = self.J_matrix.get_J()
+            else:
+                delta_J = tsodyks_feigelman(memory, self.N, f, 1, False)
+                self.J_matrix.update(delta_J)
+                self.J = self.J_matrix.get_J()
 
         if self.synapse_type == "Wdecay":
-            delta_J = basic_hebb(memory, self.N, self.hebb_alpha)
-            self.J = self.hebb_lambda * self.J + delta_J
+            if f == 0.5:
+                delta_J = basic_hebb(memory, self.N, self.hebb_alpha)
+                self.J = self.hebb_lambda * self.J + delta_J
+            else:
+                delta_J = tsodyks_feigelman(memory, self.N, f, self.hebb_alpha)
+                self.J = self.hebb_lambda * self.J + delta_J
 
-            
-        
+
         self.p += 1
         print(f"Stored one memory. Number of stored memories = {self.p}")
         return
     
-    def overlap(self, memory):
+    def overlap(self, memory, f=0.5):
+        """
+        Returns an overlap in [-1,1].
+        memory, self.n: both ±1 arrays
+        f: coding level (fraction of 1's in the 0/1 version)
+        """
         if memory.shape != (self.N,):
-            raise Exception("Memory is not in correct shape or format")
+            raise ValueError("Memory must be of shape (N,) with ±1 entries")
 
-        m = (1/self.N)*(self.n @ memory)
-        
-        return m
-        
-    def run_async(self, k_sweeps, binarized = False):
+        if f == 0.5:
+            # classic Hopfield overlap
+            return (self.n @ memory) / self.N
+
+        # sparse overlap: map ±1→{0,1}
+        eta_state  = (self.n     + 1) // 2  # 0/1 array
+        eta_memory = (memory     + 1) // 2  # 0/1 array
+
+        # centered covariance divided by variance
+        numerator   = ((eta_state - f) @ (eta_memory - f))
+        denominator = self.N * f * (1.0 - f)
+        return numerator / denominator
+
+
+
+    def run_async(self, k_sweeps, binarized = False, f = 0.5):
         """
         Asynchronous Hopfield updates.
         Each 'sweep' is N attempted flips, chosen at random.
@@ -124,8 +148,14 @@ class HopfieldNetwork:
         if binarized == True:
             J = np.where(J >= 0, 1, -1)
 
-        # 1) Compute initial fields: h_j = sum_k J[j,k] * state[k]
-        h = J.dot(state).astype(np.float64)      # one O(N^2) at start
+        h = np.zeros((self.N,))
+        if f == 0.5:
+            # classic dense Hopfield
+            h = J.dot(state).astype(np.float64)
+        else:
+            # sparse case: center activity by f
+            # state is ±1, so (state - f) gives a mean-zero input
+            h = J.dot(state - f).astype(np.float64)
 
         # 2) Pre-generate random picks to avoid Python RNG overhead inside the loop
         picks = np.random.randint(N, size=N * k_sweeps)
@@ -201,24 +231,36 @@ class HopfieldNetwork:
             print("Synapse type not recognized for weight distribution plot.")
                 
 
-    
         
            
 @njit(parallel=False)
-def basic_hebb(memory, N, alpha=1.0):
+def basic_hebb(memory, N, alpha=1.0, f = 0.5):
     '''
     Implements basic hebbian synaptic rule for hopfield model
-    Allows for a parameter to control new memory significance
+    Parameters:
+        - alpha to control new memory significance
+        - f for the coding level
     '''
 
     delta = np.empty((N, N), dtype=np.float32)
-    for i in range(N):
-        for j in range(N):
-            delta[i, j] = (memory[i] * memory[j]) / N
-    if alpha != 1.0:
-        delta *= alpha
-    for i in range(N):
-        delta[i, i] = 0
+
+    if f == 0.5:
+        for i in range(N):
+            for j in range(N):
+                delta[i, j] = (memory[i] * memory[j]) / N
+        if alpha != 1.0:
+            delta *= alpha
+        for i in range(N):
+            delta[i, i] = 0
+    else:
+        for i in range(N):
+            for j in range(N):
+                delta[i, j] = ((memory[i]-f) * (memory[j]-f)) / N
+        if alpha != 1.0:
+            delta *= alpha
+        for i in range(N):
+            delta[i, i] = 0
+
     return delta
 
 def basic_hebb_not_normalized(memory):
@@ -263,6 +305,46 @@ def store_k_memories(Network, k, f=0.5):
         Network.store_memory(pattern)
     
     return memories
+
+
+
+@njit(parallel=False)
+def tsodyks_feigelman(memory, N, f=0.5, alpha=1.0, normalize_N=True):
+    """
+    General TF update, optionally dropping the 1/N factor.
+    If normalize_N==True: ΔJ *= alpha / (N * f * (1-f))
+    else:                 ΔJ *= alpha /     (f * (1-f))
+    """
+    # 1) convert ±1→{0,1}
+    eta = np.empty(N, np.int32)
+    for i in range(N):
+        eta[i] = (memory[i] + 1)//2
+
+    # 2) raw I(η,η)
+    delta = np.empty((N, N), np.float32)
+    for i in range(N):
+        ei = eta[i]
+        for j in range(N):
+            ej = eta[j]
+            if ei and ej:
+                delta[i,j] = (1-f)*(1-f)
+            elif ei != ej:
+                delta[i,j] = -f*(1-f)
+            else:
+                delta[i,j] = f*f
+
+    # 3) normalize by f(1-f) and optionally by N
+    if normalize_N:
+        delta *= alpha / (N * f * (1.0 - f))
+    else:
+        delta *= alpha / (        f * (1.0 - f))
+
+    # 4) zero diagonal
+    for i in range(N):
+        delta[i,i] = 0.0
+
+    return delta
+
 
         
 class BfSynapsesNumba:
@@ -319,7 +401,8 @@ class BfSynapsesNumba:
         """
         return self.u[:, :, 0].copy()
 
-                
+
+# Numba function to stochastically discretize variables for Bf synapses         
 @njit
 def snap(u, levels_row, n_levels):
     """
@@ -348,10 +431,7 @@ def snap(u, levels_row, n_levels):
     return levels_row[n_levels - 1]
 
 
-# ===========================================================
-# NUMBA-COMPILED SERIAL UPDATE FUNCTION (NO PARALLELIZATION)
-# ===========================================================
-
+# Numba function to update bf synapses
 @njit
 def bf_update(u, delta_J, g, levels_array, levels_len):
     """
@@ -388,10 +468,8 @@ def bf_update(u, delta_J, g, levels_array, levels_len):
                 u[i, j, k] = snap(u[i, j, k], levels_row, n_levels)
 
 
-# ===========================================================
-# NUMBA-COMPILED PARALLEL UPDATE FUNCTION (WITH PARALLELIZATION)
-# ===========================================================
 
+# Same ad bf_update but with parallization to speed up computation
 @njit(parallel=True)
 def bf_update_parallel(u, delta_J, g, levels_array, levels_len):
     """
@@ -422,6 +500,9 @@ def bf_update_parallel(u, delta_J, g, levels_array, levels_len):
 
 
 
+
+
+
         
 #%%
 # PLAYGROUND
@@ -432,25 +513,27 @@ import time
 start = time.perf_counter()
 
 # Number of neurons
-neurons = 100
+neurons = 10000
 # Number of evolution runs
 runs = 10
 # Total memories stored before running
-tot_mem_stored = 100
+tot_mem_stored = 1
 # Memory we want to test the overlap with
-test = 99
+test = 0
+# Coding level of memories
+f = 0.5
 
 syn_specs1 = {"bf_m": 4, "bf_levels": 30, "bf_alpha": 0.25, "bf_decreasing_levels": True, "bf_beta": 2}
 syn_specsW = {"hebb_lambda" : 0.98, "hebb_alpha" : 4}
 
 Network1 = HopfieldNetwork(neurons, synapse_type = "BfLin", syn_specs = syn_specs1)
-mems = store_k_memories(Network1, tot_mem_stored)
+mems = store_k_memories(Network1, tot_mem_stored, f)
 Network1.init_at_memory(mems[test], 0.0)
 
 overlaps = np.zeros((runs,))
 for i in range(runs):
-    Network1.run_async(1, binarized = True)
-    overlaps[i] = Network1.overlap(mems[test])
+    Network1.run_async(1, binarized = True, f = f)
+    overlaps[i] = Network1.overlap(mems[test], f)
     
 plt.plot(np.arange(0,runs), overlaps)
 
