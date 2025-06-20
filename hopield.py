@@ -58,7 +58,7 @@ class HopfieldNetwork:
             else:
                 self.J_matrix = BfSynapsesNumba(N, syn_specs["bf_m"], syn_specs["bf_levels"], 
                                                     syn_specs["bf_alpha"], syn_specs["bf_decreasing_levels"], 
-                                                    syn_specs["bf_beta"], parallel=True)
+                                                    syn_specs["bf_beta"])
                 self.J = self.J_matrix.get_J()
 
         if synapse_type == "Wdecay":
@@ -68,6 +68,9 @@ class HopfieldNetwork:
                 raise Exception("Initial J not implemented for BfLin")
             else:
                 self.J = np.zeros((N,N), dtype=np.float32)
+
+        # Store synapse specifications as attribute of the network
+        self.syn_specs = syn_specs
             
         # Number of memories stored
         self.p = 0 
@@ -81,8 +84,7 @@ class HopfieldNetwork:
                 delta_J = basic_hebb(memory, self.N)
                 self.J += np.float32(delta_J)
             else:
-                delta_J = tsodyks_feigelman(memory, self.N, f)
-                self.J += np.float32(delta_J)
+                pass
 
         if self.synapse_type == "BfLin":
             if f == 0.5:
@@ -90,17 +92,14 @@ class HopfieldNetwork:
                 self.J_matrix.update(delta_J)
                 self.J = self.J_matrix.get_J()
             else:
-                delta_J = tsodyks_feigelman(memory, self.N, f, 1, False)
-                self.J_matrix.update(delta_J)
-                self.J = self.J_matrix.get_J()
+                pass
 
         if self.synapse_type == "Wdecay":
             if f == 0.5:
                 delta_J = basic_hebb(memory, self.N, self.hebb_alpha)
                 self.J = self.hebb_lambda * self.J + delta_J
             else:
-                delta_J = tsodyks_feigelman(memory, self.N, f, self.hebb_alpha)
-                self.J = self.hebb_lambda * self.J + delta_J
+                pass
 
 
         self.p += 1
@@ -116,22 +115,17 @@ class HopfieldNetwork:
         if memory.shape != (self.N,):
             raise ValueError("Memory must be of shape (N,) with ±1 entries")
 
+        m = 0
         if f == 0.5:
-            # classic Hopfield overlap
-            return (self.n @ memory) / self.N
+            m = (1/self.N)*(self.n @ memory)
+        else:
+            pass
 
-        # sparse overlap: map ±1→{0,1}
-        eta_state  = (self.n     + 1) // 2  # 0/1 array
-        eta_memory = (memory     + 1) // 2  # 0/1 array
-
-        # centered covariance divided by variance
-        numerator   = ((eta_state - f) @ (eta_memory - f))
-        denominator = self.N * f * (1.0 - f)
-        return numerator / denominator
+        return m
 
 
-
-    def run_async(self, k_sweeps, binarized = False, f = 0.5):
+    # Mess in this function: to add case for binarized runnning and for sparse coding
+    def run_async(self, k_sweeps, binarized = True, f=0.5):
         """
         Asynchronous Hopfield updates.
         Each 'sweep' is N attempted flips, chosen at random.
@@ -145,17 +139,8 @@ class HopfieldNetwork:
         state = self.n            # direct view on self.n
         J = self.J.copy()
 
-        if binarized == True:
-            J = np.where(J >= 0, 1, -1)
-
-        h = np.zeros((self.N,))
-        if f == 0.5:
-            # classic dense Hopfield
-            h = J.dot(state).astype(np.float64)
-        else:
-            # sparse case: center activity by f
-            # state is ±1, so (state - f) gives a mean-zero input
-            h = J.dot(state - f).astype(np.float64)
+        # 1) Compute initial fields: h_j = sum_k J[j,k] * state[k]
+        h = J.dot(state).astype(np.float64)      # one O(N^2) at start
 
         # 2) Pre-generate random picks to avoid Python RNG overhead inside the loop
         picks = np.random.randint(N, size=N * k_sweeps)
@@ -306,46 +291,6 @@ def store_k_memories(Network, k, f=0.5):
     
     return memories
 
-
-
-@njit(parallel=False)
-def tsodyks_feigelman(memory, N, f=0.5, alpha=1.0, normalize_N=True):
-    """
-    General TF update, optionally dropping the 1/N factor.
-    If normalize_N==True: ΔJ *= alpha / (N * f * (1-f))
-    else:                 ΔJ *= alpha /     (f * (1-f))
-    """
-    # 1) convert ±1→{0,1}
-    eta = np.empty(N, np.int32)
-    for i in range(N):
-        eta[i] = (memory[i] + 1)//2
-
-    # 2) raw I(η,η)
-    delta = np.empty((N, N), np.float32)
-    for i in range(N):
-        ei = eta[i]
-        for j in range(N):
-            ej = eta[j]
-            if ei and ej:
-                delta[i,j] = (1-f)*(1-f)
-            elif ei != ej:
-                delta[i,j] = -f*(1-f)
-            else:
-                delta[i,j] = f*f
-
-    # 3) normalize by f(1-f) and optionally by N
-    if normalize_N:
-        delta *= alpha / (N * f * (1.0 - f))
-    else:
-        delta *= alpha / (        f * (1.0 - f))
-
-    # 4) zero diagonal
-    for i in range(N):
-        delta[i,i] = 0.0
-
-    return delta
-
-
         
 class BfSynapsesNumba:
     """
@@ -353,15 +298,26 @@ class BfSynapsesNumba:
     Can run either in serial or parallel mode.
     """
 
-    def __init__(self, N, m, levels, alpha=0.25, decreasing_levels=True, beta=2, parallel=False):
+    def __init__(self, N, m, levels, alpha=0.25, decreasing_levels=True, beta=2):
         self.N = N
         self.m = m
         self.alpha = alpha
         self.beta = beta
-        self.parallel = parallel  # If True, uses parallel update kernel
 
         self.u = np.zeros((N, N, m), dtype=np.float32)
-        self.g = np.array([beta ** (-2 * i + 1) * alpha for i in range(m-1)], dtype=np.float32)
+        self.g = np.zeros((m,m), dtype=np.float32)
+
+        # Compute g values such that delta-u_k = g_{k,k-1}*alpha*(u_{k-1} - u_k) + g_{k,k+1}*alpha*(u_{k+1} - u_k)
+        # Where g_{k,k-1} = beta^(-2k + 2)   |   g_{k,k+1} = beta^(-2k + 1)   
+        # Note that in the mathematical formula i = 1,...,m . We'll have to deal with arrays going from 0,...,(m-1)
+        # We will store g_{k,k-1} in the matrix self.g at position (k-1, k-2), and g_{k,k-1} at (k-1, k)
+
+        for i in range(m):
+            for j in range(m):
+                if j == i-1:
+                    self.g[i,j] = beta**(-2*(i+1) + 2)
+                if j == i+1:
+                    self.g[i,j] = beta**(-2*(i+1) + 1)
 
         # Build levels for each internal variable (heterogeneous)
         self.levels_list = []
@@ -390,10 +346,7 @@ class BfSynapsesNumba:
         """
         Update synapses using the precompiled Numba kernel.
         """
-        if self.parallel:
-            bf_update_parallel(self.u, delta_J, self.g, self.levels_array, self.levels_len)
-        else:
-            bf_update(self.u, delta_J, self.g, self.levels_array, self.levels_len)
+        bf_update_parallel(self.u, delta_J, self.g, self.levels_array, self.levels_len)
 
     def get_J(self):
         """
@@ -431,48 +384,18 @@ def snap(u, levels_row, n_levels):
     return levels_row[n_levels - 1]
 
 
-# Numba function to update bf synapses
-@njit
-def bf_update(u, delta_J, g, levels_array, levels_len):
+
+
+# Function to update the Bf synapse matrix. Leverages Numba faster compilation and parallilazion to speed up the process
+@njit(parallel=True)
+def bf_update_parallel(u, delta_J, g, levels_array, levels_len):
     """
     Core Benna & Fusi update rule — serial version.
     u: synapse state array, shape (N, N, m)
     delta_J: Hebbian input, shape (N, N)
-    g: coupling constants, shape (m-1,)
+    g: coupling constants, shape (m,m)
     levels_array: allowed levels, shape (m, max_levels)
     levels_len: number of levels per internal variable, shape (m,)
-    """
-    N, _, m = u.shape
-    u_copy = u.copy()
-
-    for i in range(N):
-        for j in range(N):
-
-            # Update fast variable (k = 0)
-            u[i, j, 0] = u_copy[i, j, 0] + delta_J[i, j] + g[0] * (u_copy[i, j, 1] - u_copy[i, j, 0])
-
-            # Update intermediate variables (k = 1 to m-2)
-            for k in range(1, m-1):
-                u[i, j, k] = (u_copy[i, j, k] 
-                              + g[k-1] * (u_copy[i, j, k-1] - u_copy[i, j, k]) 
-                              + g[k] * (u_copy[i, j, k+1] - u_copy[i, j, k]))
-
-            # Update slowest variable (k = m-1)
-            u[i, j, m-1] = (u_copy[i, j, m-1] 
-                            + g[m-2] * (u_copy[i, j, m-2] - u_copy[i, j, m-1]))
-
-            # Stochastic snapping for all m internal variables
-            for k in range(m):
-                levels_row = levels_array[k, :]
-                n_levels = levels_len[k]
-                u[i, j, k] = snap(u[i, j, k], levels_row, n_levels)
-
-
-
-# Same ad bf_update but with parallization to speed up computation
-@njit(parallel=True)
-def bf_update_parallel(u, delta_J, g, levels_array, levels_len):
-    """
     Same update rule as above, but fully parallelized across synapses.
     """
     N, _, m = u.shape
@@ -482,15 +405,15 @@ def bf_update_parallel(u, delta_J, g, levels_array, levels_len):
         i = idx // N
         j = idx % N
 
-        u[i, j, 0] = u_copy[i, j, 0] + delta_J[i, j] + g[0] * (u_copy[i, j, 1] - u_copy[i, j, 0])
+        u[i, j, 0] = u_copy[i, j, 0] + delta_J[i, j] + g[1,0] * (u_copy[i, j, 1] - u_copy[i, j, 0])
 
         for k in range(1, m-1):
             u[i, j, k] = (u_copy[i, j, k] 
-                          + g[k-1] * (u_copy[i, j, k-1] - u_copy[i, j, k]) 
-                          + g[k] * (u_copy[i, j, k+1] - u_copy[i, j, k]))
+                          + g[k, k-1] * (u_copy[i, j, k-1] - u_copy[i, j, k]) 
+                          + g[k, k+1] * (u_copy[i, j, k+1] - u_copy[i, j, k]))
 
         u[i, j, m-1] = (u_copy[i, j, m-1] 
-                        + g[m-2] * (u_copy[i, j, m-2] - u_copy[i, j, m-1]))
+                        + g[m-1, m-2] * (u_copy[i, j, m-2] - u_copy[i, j, m-1]))
 
         for k in range(m):
             levels_row = levels_array[k, :]
@@ -513,11 +436,11 @@ import time
 start = time.perf_counter()
 
 # Number of neurons
-neurons = 10000
+neurons = 100
 # Number of evolution runs
 runs = 10
 # Total memories stored before running
-tot_mem_stored = 1
+tot_mem_stored = 800
 # Memory we want to test the overlap with
 test = 0
 # Coding level of memories
@@ -537,7 +460,7 @@ for i in range(runs):
     
 plt.plot(np.arange(0,runs), overlaps)
 
-# Network1.plot_weight_distribution()
+Network1.plot_weight_distribution()
 
 end = time.perf_counter()
 print(f"Elapsed: {end - start:.4f} seconds")
@@ -576,6 +499,11 @@ def overlap_in_time_plot(cat_forgetting, synapse_type, N, n_mem, time, noise, n_
         
         # Create a network
         Net = HopfieldNetwork(N, synapse_type, syn_specs)
+
+        # As suggested by the authors of Bf, before starting to track memories store a number of memories "large compared to n^(2m) to reach steady state"
+        if synapse_type == "BfLin":
+            pass
+            #  y = store_k_memories(Net, 2**(2*Net.syn_specs["bf_m"]))
         
         # Initialize where to store memories
         memories = np.zeros((time, Net.N))
@@ -651,11 +579,11 @@ def overlap_in_time_plot(cat_forgetting, synapse_type, N, n_mem, time, noise, n_
 
     return overlaps_standard, overlaps_noise
         
-syn_specs2 = {"bf_m" : 4, "bf_levels" : 35, "bf_alpha" : 0.25, "bf_decreasing_levels" : True, "bf_beta": 2}
+syn_specs2 = {"bf_m" : 4, "bf_levels" : 30, "bf_alpha" : 0.25, "bf_decreasing_levels" : True, "bf_beta": 2}
 syn_specs3 = {"hebb_lambda" : 0.99, "hebb_alpha" : 4.0}
 
-hold1, hold2 = overlap_in_time_plot(cat_forgetting = True, synapse_type="Wdecay", N = 500, n_mem = 2, time = 500, noise = 0.25, n_sweeps = 10, 
-                     syn_specs = syn_specs3, binarized = True, show_plot = True)
+hold1, hold2 = overlap_in_time_plot(cat_forgetting = False, synapse_type="BfLin", N = 1000, n_mem = 2, time = 150, noise = 0.25, n_sweeps = 10, 
+                     syn_specs = syn_specs2, binarized = False, show_plot = True)
 
 
 
@@ -700,7 +628,7 @@ def mem_lifetime_calc(iterations, synapse_type, N, time, noise, n_sweeps, syn_sp
 syn_specs2 = {"bf_m" : 4, "bf_levels" : 45, "bf_alpha" : 0.25, "bf_decreasing_levels" : True, "bf_beta": 2}
 syn_specs3 = {"hebb_lambda" : 0.98, "hebb_alpha" : 4.0}
 
-mem_lifetime_calc(10, synapse_type = "BfLin", N = 200, time = 30, noise = 0.25, 
+mem_lifetime_calc(10, synapse_type = None, N = 100, time = 30, noise = 0.25, 
                   n_sweeps = 10, syn_specs = syn_specs2, binarized = False)
 
 
