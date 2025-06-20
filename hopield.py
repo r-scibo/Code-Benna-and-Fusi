@@ -1,6 +1,5 @@
 #%%
 import numpy as np
-import matplotlib 
 from matplotlib import pyplot as plt
 import math
 from numba import njit, prange
@@ -8,6 +7,7 @@ from numba import njit, prange
 # Everytime I run (setting up virtual invironment compatible with numba)
 # cd ~/path/to/Code-Benna-and-Fusi
 # source bf_env/bin/activate
+
 
 
 # First try an implmentation of basic hopfield model
@@ -29,7 +29,7 @@ class HopfieldNetwork:
         - Runs asynchronous dynamics of the network from the current staus
     '''
 
-    def __init__ (self, N, synapse_type = None, syn_specs={}, initial_J = None):
+    def __init__ (self, N, synapse_type = None, syn_specs={}, initial_J = None, c = None):
         '''
         Takes as inputs:
             - N: number of neurons
@@ -39,11 +39,20 @@ class HopfieldNetwork:
                 - "BfLin": Benna and Fusi 2016 synapse linear 
                 - "Wdecay": Hebbian synapse with decay parameter Jij(t+1) = lambda*Jij(t) + (alpha/N)*epsi*epsj
             - syn_specs: disctionary with the parameters needed for each type of synapse
+            - c: if present specifies the level of sparsity in synaptic connection -> Erdos Renyi network with cN edges
         '''
         
         self.N = N   
         self.synapse_type = synapse_type
-        
+        self.c = c
+        self.mask = None
+
+        # If sparsely connected network create a mask
+        if c != None:
+            self.mask = (np.random.rand(N, N) < c).astype(int)
+        else:
+            self.mask = np.ones((N, N), dtype=np.int8)
+            
         # Current neuronal state
         self.n = np.random.choice([-1, +1], size=N)   # random ±1 initial state   
     
@@ -56,7 +65,7 @@ class HopfieldNetwork:
             if initial_J != None:
                 raise Exception("Initial J not implemented for BfLin")
             else:
-                self.J_matrix = BfSynapsesNumba(N, syn_specs["bf_m"], syn_specs["bf_levels"], 
+                self.J_matrix = BfSynapsesNumba(N, c, self.mask, syn_specs["bf_m"], syn_specs["bf_levels"], 
                                                     syn_specs["bf_alpha"], syn_specs["bf_decreasing_levels"], 
                                                     syn_specs["bf_beta"])
                 self.J = self.J_matrix.get_J()
@@ -69,11 +78,15 @@ class HopfieldNetwork:
             else:
                 self.J = np.zeros((N,N), dtype=np.float32)
 
+
         # Store synapse specifications as attribute of the network
         self.syn_specs = syn_specs
             
         # Number of memories stored
         self.p = 0 
+
+
+
         
     def store_memory (self, memory, f=0.5):
         if memory.shape != (self.N,):
@@ -82,6 +95,8 @@ class HopfieldNetwork:
         if self.synapse_type == None:
             if f == 0.5:
                 delta_J = basic_hebb(memory, self.N)
+                if self.c != None:
+                    delta_J *= self.mask/self.c
                 self.J += np.float32(delta_J)
             else:
                 pass
@@ -89,6 +104,8 @@ class HopfieldNetwork:
         if self.synapse_type == "BfLin":
             if f == 0.5:
                 delta_J = basic_hebb_not_normalized(memory)
+                # if self.c != None:
+                #    delta_J *= self.mask/self.c
                 self.J_matrix.update(delta_J)
                 self.J = self.J_matrix.get_J()
             else:
@@ -97,6 +114,8 @@ class HopfieldNetwork:
         if self.synapse_type == "Wdecay":
             if f == 0.5:
                 delta_J = basic_hebb(memory, self.N, self.hebb_alpha)
+                if self.c != None:
+                    delta_J *= self.mask/self.c
                 self.J = self.hebb_lambda * self.J + delta_J
             else:
                 pass
@@ -298,8 +317,10 @@ class BfSynapsesNumba:
     Can run either in serial or parallel mode.
     """
 
-    def __init__(self, N, m, levels, alpha=0.25, decreasing_levels=True, beta=2):
+    def __init__(self, N, mask, c, m, levels, alpha=0.25, decreasing_levels=True, beta=2):
         self.N = N
+        self.c = c
+        self.mask = mask
         self.m = m
         self.alpha = alpha
         self.beta = beta
@@ -315,9 +336,9 @@ class BfSynapsesNumba:
         for i in range(m):
             for j in range(m):
                 if j == i-1:
-                    self.g[i,j] = beta**(-2*(i+1) + 2)
+                    self.g[i,j] = beta**(-2*(i+1) + 2)*alpha
                 if j == i+1:
-                    self.g[i,j] = beta**(-2*(i+1) + 1)
+                    self.g[i,j] = beta**(-2*(i+1) + 1)*alpha
 
         # Build levels for each internal variable (heterogeneous)
         self.levels_list = []
@@ -346,13 +367,15 @@ class BfSynapsesNumba:
         """
         Update synapses using the precompiled Numba kernel.
         """
-        bf_update_parallel(self.u, delta_J, self.g, self.levels_array, self.levels_len)
+        bf_update_parallel(self.u, self.mask, delta_J, self.g, self.levels_array, self.levels_len)
 
     def get_J(self):
         """
         Extract current effective synaptic matrix (first internal variable).
         """
-        return self.u[:, :, 0].copy()
+
+        J = self.u[:, :, 0].copy()
+        return J
 
 
 # Numba function to stochastically discretize variables for Bf synapses         
@@ -388,7 +411,7 @@ def snap(u, levels_row, n_levels):
 
 # Function to update the Bf synapse matrix. Leverages Numba faster compilation and parallilazion to speed up the process
 @njit(parallel=True)
-def bf_update_parallel(u, delta_J, g, levels_array, levels_len):
+def bf_update_parallel(u, mask, delta_J, g, levels_array, levels_len):
     """
     Core Benna & Fusi update rule — serial version.
     u: synapse state array, shape (N, N, m)
@@ -405,23 +428,27 @@ def bf_update_parallel(u, delta_J, g, levels_array, levels_len):
         i = idx // N
         j = idx % N
 
+        # If synapse does not exist, skip
+        if mask[i, j] == 0:
+            continue
+
+        # Otherwise, update the first variable, which receives the hebbian input
         u[i, j, 0] = u_copy[i, j, 0] + delta_J[i, j] + g[1,0] * (u_copy[i, j, 1] - u_copy[i, j, 0])
-
+        
+        # Update internal varibles according to formula u_k(t+1) = u_k(t) + alpha*g_{k,k-1}*(u_{k-1}(t) - u_k(t)) + alpha*g_{k,k+1}*(u_{k+1}(t) - u_k(t))
         for k in range(1, m-1):
-            u[i, j, k] = (u_copy[i, j, k] 
-                          + g[k, k-1] * (u_copy[i, j, k-1] - u_copy[i, j, k]) 
+            u[i, j, k] = (u_copy[i, j, k]
+                          + g[k, k-1] * (u_copy[i, j, k-1] - u_copy[i, j, k])
                           + g[k, k+1] * (u_copy[i, j, k+1] - u_copy[i, j, k]))
-
-        u[i, j, m-1] = (u_copy[i, j, m-1] 
+            
+        # Update last variable, which has leakage term = 0 
+        u[i, j, m-1] = (u_copy[i, j, m-1]
                         + g[m-1, m-2] * (u_copy[i, j, m-2] - u_copy[i, j, m-1]))
 
+        # Sotchastically discretize the synapses
         for k in range(m):
-            levels_row = levels_array[k, :]
-            n_levels = levels_len[k]
-            u[i, j, k] = snap(u[i, j, k], levels_row, n_levels)
-
-
-
+            val = snap(u[i, j, k], levels_array[k], levels_len[k])
+            u[i, j, k] = val  
 
 
 
@@ -440,16 +467,16 @@ neurons = 100
 # Number of evolution runs
 runs = 10
 # Total memories stored before running
-tot_mem_stored = 800
+tot_mem_stored = 50
 # Memory we want to test the overlap with
-test = 0
+test = 49
 # Coding level of memories
 f = 0.5
 
 syn_specs1 = {"bf_m": 4, "bf_levels": 30, "bf_alpha": 0.25, "bf_decreasing_levels": True, "bf_beta": 2}
 syn_specsW = {"hebb_lambda" : 0.98, "hebb_alpha" : 4}
 
-Network1 = HopfieldNetwork(neurons, synapse_type = "BfLin", syn_specs = syn_specs1)
+Network1 = HopfieldNetwork(neurons, synapse_type = "BfLin", syn_specs = syn_specs1, c = 0.1)
 mems = store_k_memories(Network1, tot_mem_stored, f)
 Network1.init_at_memory(mems[test], 0.0)
 
@@ -471,7 +498,7 @@ print(f"Elapsed: {end - start:.4f} seconds")
 
 # Plot from Benna and Fusi hopfield network
 
-def overlap_in_time_plot(cat_forgetting, synapse_type, N, n_mem, time, noise, n_sweeps, syn_specs, binarized, show_plot = True):
+def overlap_in_time_plot(cat_forgetting, synapse_type, N, c, n_mem, time, noise, n_sweeps, syn_specs, binarized, show_plot = True):
     '''
     Inputs:
         - cat_forgetting: 
@@ -498,9 +525,10 @@ def overlap_in_time_plot(cat_forgetting, synapse_type, N, n_mem, time, noise, n_
     for j in range(n_mem):
         
         # Create a network
-        Net = HopfieldNetwork(N, synapse_type, syn_specs)
+        Net = HopfieldNetwork(N, synapse_type, syn_specs, c= c)
 
         # As suggested by the authors of Bf, before starting to track memories store a number of memories "large compared to n^(2m) to reach steady state"
+        # Before using this evaluate if it is true that that this network is not effected by cathastrophic forgetting
         if synapse_type == "BfLin":
             pass
             #  y = store_k_memories(Net, 2**(2*Net.syn_specs["bf_m"]))
@@ -581,8 +609,9 @@ def overlap_in_time_plot(cat_forgetting, synapse_type, N, n_mem, time, noise, n_
         
 syn_specs2 = {"bf_m" : 4, "bf_levels" : 30, "bf_alpha" : 0.25, "bf_decreasing_levels" : True, "bf_beta": 2}
 syn_specs3 = {"hebb_lambda" : 0.99, "hebb_alpha" : 4.0}
+c = 0.1
 
-hold1, hold2 = overlap_in_time_plot(cat_forgetting = False, synapse_type="BfLin", N = 1000, n_mem = 2, time = 150, noise = 0.25, n_sweeps = 10, 
+hold1, hold2 = overlap_in_time_plot(cat_forgetting = False, synapse_type="BfLin", N = 1000, c = c, n_mem = 2, time = 150, noise = 0.25, n_sweeps = 10, 
                      syn_specs = syn_specs2, binarized = False, show_plot = True)
 
 
