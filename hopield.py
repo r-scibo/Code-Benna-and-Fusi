@@ -24,7 +24,7 @@ class HopfieldNetwork:
         - Inputs: memory to compute the overlap with
         - Computes the overlap between memory and current status
         
-    run_dynamics
+    run_async
         - Inputs: number of iterations, temperature
         - Runs asynchronous dynamics of the network from the current staus
     '''
@@ -86,7 +86,6 @@ class HopfieldNetwork:
         self.p = 0 
 
 
-
         
     def store_memory (self, memory, f=0.5):
         if memory.shape != (self.N,):
@@ -104,8 +103,6 @@ class HopfieldNetwork:
         if self.synapse_type == "BfLin":
             if f == 0.5:
                 delta_J = basic_hebb_not_normalized(memory)
-                # if self.c != None:
-                #    delta_J *= self.mask/self.c
                 self.J_matrix.update(delta_J)
                 self.J = self.J_matrix.get_J()
             else:
@@ -144,7 +141,7 @@ class HopfieldNetwork:
 
 
     # Mess in this function: to add case for binarized runnning and for sparse coding
-    def run_async(self, k_sweeps, binarized = True, f=0.5):
+    def run_async(self, k_sweeps, binarized = False):
         """
         Asynchronous Hopfield updates.
         Each 'sweep' is N attempted flips, chosen at random.
@@ -237,7 +234,7 @@ class HopfieldNetwork:
 
         
            
-@njit(parallel=False)
+
 def basic_hebb(memory, N, alpha=1.0, f = 0.5):
     '''
     Implements basic hebbian synaptic rule for hopfield model
@@ -245,25 +242,10 @@ def basic_hebb(memory, N, alpha=1.0, f = 0.5):
         - alpha to control new memory significance
         - f for the coding level
     '''
-
-    delta = np.empty((N, N), dtype=np.float32)
-
-    if f == 0.5:
-        for i in range(N):
-            for j in range(N):
-                delta[i, j] = (memory[i] * memory[j]) / N
-        if alpha != 1.0:
-            delta *= alpha
-        for i in range(N):
-            delta[i, i] = 0
-    else:
-        for i in range(N):
-            for j in range(N):
-                delta[i, j] = ((memory[i]-f) * (memory[j]-f)) / N
-        if alpha != 1.0:
-            delta *= alpha
-        for i in range(N):
-            delta[i, i] = 0
+    delta = np.outer(memory, memory).astype(np.float32) / N
+    np.fill_diagonal(delta, 0)
+    if alpha != 1.0:
+        delta *= alpha
 
     return delta
 
@@ -277,7 +259,7 @@ def basic_hebb_not_normalized(memory):
     return delta
 
 
-def store_k_memories(Network, k, f=0.5):
+def store_k_memories(Network, k, f=0.5, zero_one = False):
     '''
     Stores k random memories in the network
     Saves each memory at row i of a numpy array
@@ -289,17 +271,21 @@ def store_k_memories(Network, k, f=0.5):
     memories = np.zeros((k, N), dtype=np.float32)
     
     for i in range(k):
+
+        pattern = 0
         
         if f == 0.5:
-            # classical dense coding: each neuron ±1 with equal probability
-            pattern = np.random.choice([-1, +1], size=N).astype(np.float32)
+            if zero_one == False:
+                # classical dense coding: each neuron ±1 with equal probability
+                pattern = np.random.choice([-1, +1], size=N).astype(np.float32)
+            else:
+                #  dense coding with each neuron 0,1 with equal probability
+                pattern = np.random.choice([0, +1], size=N).astype(np.float32)
         
         else:
-            # sparse coding: exactly f*N active (+1), rest -1
-            if not (0 < f <= 1):
-                raise ValueError("f must be in (0, 1] for sparse=True")
+            # sparse coding: exactly f*N active (+1), rest 0
             
-            pattern = np.full(N, -1, dtype=int)
+            pattern = np.full(N, dtype=np.float32)
             dim = int(np.round(f * N))
             # choose k distinct positions to activate
             active_idx = np.random.choice(N, size=dim, replace=False)
@@ -429,8 +415,8 @@ def bf_update_parallel(u, mask, delta_J, g, levels_array, levels_len):
         j = idx % N
 
         # If synapse does not exist, skip
-        if mask[i, j] == 0:
-            continue
+        # if mask[i, j] == 0:
+        #    continue
 
         # Otherwise, update the first variable, which receives the hebbian input
         u[i, j, 0] = u_copy[i, j, 0] + delta_J[i, j] + g[1,0] * (u_copy[i, j, 1] - u_copy[i, j, 0])
@@ -450,6 +436,206 @@ def bf_update_parallel(u, mask, delta_J, g, levels_array, levels_len):
             val = snap(u[i, j, k], levels_array[k], levels_len[k])
             u[i, j, k] = val  
 
+
+
+class SparseCodingNetwork(HopfieldNetwork):
+    '''
+    Similar implementation to HopfieldNetwork allowing for sparse coding.
+    The model will have binary neurons n = 0,1.
+    Methods and inputs will be the same, with the addition of coding level
+    '''
+
+    def __init__ (self, N, f, synapse_type = None, syn_specs={}, initial_J = None, c = None):
+        '''
+        Same intputs as before, with the addition of:
+            - f: coding level of memrories (how many neurons are active in each memory)
+            - synapse_type: also supports
+                - "DoubleW": double well synapses
+        '''
+        
+        self.N = N   
+        self.f = f
+        self.synapse_type = synapse_type
+        self.c = c
+        self.mask = None
+
+        # If sparsely connected network create a mask
+        if c != None:
+            self.mask = (np.random.rand(N, N) < c).astype(int)
+        else:
+            self.mask = np.ones((N, N), dtype=np.int8)
+            
+        # Current neuronal state
+        self.n = np.random.choice([0, +1], size=N)   # random 0,1 initial state   
+
+        # Initial synapse matrix
+        if synapse_type == None:
+            self.J = np.zeros((N,N), dtype=np.float32)
+
+        if synapse_type == "BfLin":
+            self.J_matrix = BfSynapsesNumba(N, c, self.mask, syn_specs["bf_m"], syn_specs["bf_levels"], 
+                                                    syn_specs["bf_alpha"], syn_specs["bf_decreasing_levels"], 
+                                                    syn_specs["bf_beta"])
+            self.J = self.J_matrix.get_J()
+
+        if synapse_type == "Wdecay":
+            self.hebb_lambda = syn_specs["hebb_lambda"]
+            self.hebb_alpha = syn_specs["hebb_alpha"]
+            self.J = np.zeros((N,N), dtype=np.float32)
+
+        if synapse_type == "DoubleW":
+            self.J = np.zeros((N,N), dtype=np.float32)
+
+        # Store synapse specifications as attribute of the network
+        self.syn_specs = syn_specs
+            
+        # Number of memories stored
+        self.p = 0 
+
+
+
+    def store_memory (self, memory, f=0.5):
+        if memory.shape != (self.N,):
+            raise Exception("Memory is not in correct shape or format")
+        
+        # Note that in this case the memory will be in the form of 0,1 -> reshape before basic_hebb
+
+        if self.synapse_type == None:
+            if f == 0.5:
+                memory2 = memory*2 -1
+                delta_J = basic_hebb(memory2, self.N)
+                if self.c != None:
+                    delta_J *= self.mask/self.c 
+                self.J += np.float32(delta_J)
+            else:
+                delta_J = tsodyks_feigelman(memory, self.f) / self.N
+                if self.c != None:
+                    delta_J *= self.mask/self.c 
+                self.J += np.float32(delta_J)  
+
+             
+
+        if self.synapse_type == "BfLin":
+            if f == 0.5:
+                memory2 = memory*2 -1
+                delta_J = basic_hebb_not_normalized(memory2)
+                self.J_matrix.update(delta_J)
+                self.J = self.J_matrix.get_J()
+            else:
+                delta_J = tsodyks_feigelman(memory, self.f)
+                self.J_matrix.update(delta_J)
+                self.J = self.J_matrix.get_J()
+
+
+        if self.synapse_type == "Wdecay":
+            if f == 0.5:
+                memory2 = memory*2 -1
+                delta_J = basic_hebb(memory2, self.N, self.hebb_alpha)
+                if self.c != None:
+                    delta_J *= self.mask/self.c 
+                self.J = self.hebb_lambda * self.J + delta_J
+            else:
+                delta_J = tsodyks_feigelman(memory, self.f) * self.hebb_alpha
+                if self.c != None:
+                    delta_J *= self.mask/self.c 
+                self.J = self.hebb_lambda * self.J + delta_J
+
+
+        if self.synapse_type == "DoubleW":
+            delta_J = 0
+            if f == 0.5:
+                memory2 = memory*2 -1
+                delta_J = basic_hebb_not_normalized(memory2)
+            else:
+                delta_J = tsodyks_feigelman(memory, self.f)
+            
+            r1 = self.syn_specs["DW_r1"]
+            r2 = self.syn_specs["DW_r2"]
+            r3 = self.syn_specs["DW_r3"]
+            C = self.syn_specs["DW_C"]
+
+            noise = 0
+            if r3 != 0:
+                noise = r3 * np.random.randn(self.N, self.N)
+
+
+            self.J += -r1*dU(C, self.J) +r2*delta_J + noise      
+
+        np.fill_diagonal(self.J, 0)
+
+        self.p += 1
+        print(f"Stored one memory. Number of stored memories = {self.p}")
+        return
+    
+    
+    def overlap(self, memory, f=0.5):
+        """
+        Returns an overlap in [-1,1].
+        memory, self.n: both 0,1 arrays
+        f: coding level (fraction of 1's in the 0/1 version)
+        """
+        if memory.shape != (self.N,):
+            raise ValueError("Memory must be of shape (N,) with ±1 entries")
+
+        centered = memory - f
+        m = (1/(self.N*f*(1-f)))*(self.n @ centered)
+
+        return m
+    
+
+    def run_async(self, k_sweeps, binarized = True):
+
+        # If we have Double Well synapses we run parallel update, as written in orginial Feng-Brunel 2024 paper.
+        # It goes according to the follwoing update rule: h_i = 1/N * sum[over j](J_{ij} * n_j(t))  n_i(t+1) = Heavyside(h_i)
+        if self.synapse_type == "DoubleW":
+            for _ in range(k_sweeps):
+                h = self.J.dot(self.n) / self.N
+                self.n = np.heaviside(h, 0)
+
+        else:
+                N = self.N
+                state = self.n              # direct view of the 0/1 state
+                J = self.J                  # already masked & centered
+
+                # 1) Initial fields: h_j = (1/N) sum_k J[j,k] * state[k]
+                #    If you'd like to keep the 1/N factor, add it here and in the delta‐update below.
+                h = J.dot(state).astype(np.float64)
+
+                # 2) Pre‐draw all the random neuron indices
+                picks = np.random.randint(0, N, size=N * k_sweeps)
+
+                # 3) Asynchronous updates
+                for i in picks:
+                    old_si = state[i]
+                    new_si = 1 if h[i] >= 0 else 0
+
+                    if new_si != old_si:
+                        delta = new_si - old_si      # now delta∈{+1, -1}
+                        state[i] = new_si
+                        h += delta * J[:, i] 
+
+        return
+
+    
+
+# Calculates the derivative of the potential for double well synaptic model
+def dU(C, x):
+    '''
+    Inputs:
+        - C: width of potential well
+        - x: (N,N) np array of synaptic efficacies
+    '''
+    return 2*x + 2*C * np.sign(x)
+
+        
+# Calculates synaptic update based on tsodyks feigelman model
+def tsodyks_feigelman(memory, f):
+
+    centered = memory - f
+    delta = np.outer(centered, centered).astype(np.float32)
+    np.fill_diagonal(delta, 0)
+
+    return delta
 
 
 
@@ -612,14 +798,15 @@ syn_specs3 = {"hebb_lambda" : 0.99, "hebb_alpha" : 4.0}
 c = 0.1
 
 hold1, hold2 = overlap_in_time_plot(cat_forgetting = False, synapse_type="BfLin", N = 1000, c = c, n_mem = 2, time = 150, noise = 0.25, n_sweeps = 10, 
-                     syn_specs = syn_specs2, binarized = False, show_plot = True)
+                     syn_specs = syn_specs2,  binarized = False, show_plot = True)
 
 
 
 
 
 
-# %% # Calculate max memory lifetime
+#%% 
+# # Calculate max memory lifetime
 
 def mem_lifetime_calc(iterations, synapse_type, N, time, noise, n_sweeps, syn_specs, binarized):
     '''
