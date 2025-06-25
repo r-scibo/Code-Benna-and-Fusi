@@ -8,8 +8,6 @@ from numba import njit, prange
 # cd ~/path/to/Code-Benna-and-Fusi
 # source bf_env/bin/activate
 
-
-
 # First try an implmentation of basic hopfield model
 
 class HopfieldNetwork:
@@ -135,7 +133,7 @@ class HopfieldNetwork:
         print(f"Stored one memory. Number of stored memories = {self.p}")
         return
     
-    def overlap(self, memory, f=0.5):
+    def overlap(self, memory):
         """
         Returns an overlap in [-1,1].
         memory, self.n: both ±1 arrays
@@ -144,11 +142,8 @@ class HopfieldNetwork:
         if memory.shape != (self.N,):
             raise ValueError("Memory must be of shape (N,) with ±1 entries")
 
-        m = 0
-        if f == 0.5:
-            m = (1/self.N)*(self.n @ memory)
-        else:
-            pass
+
+        m = (1/self.N)*(self.n @ memory)
 
         return m
 
@@ -529,7 +524,7 @@ class SparseCodingNetwork(HopfieldNetwork):
                     delta_J *= self.mask/self.c 
                 self.J += np.float32(delta_J)
             else:
-                delta_J = tsodyks_feigelman(memory, self.f) / self.N
+                delta_J = tsodyks_feigelman(memory, self.f) / (self.N*self.f*(1-self.f))
                 if self.c != None:
                     delta_J *= self.mask/self.c 
                 self.J += np.float32(delta_J)  
@@ -614,7 +609,7 @@ class SparseCodingNetwork(HopfieldNetwork):
                 # # Center the state so threshold = 0 automatically
                 centered_state = self.n - self.f       # now ∈ {–f, 1–f}
 
-                h = self.J.dot(centered_state)
+                h = self.J.dot(centered_state) / self.N
 
                 # zero threshold on centered field
                 self.n = (h >= 0).astype(int)
@@ -626,7 +621,8 @@ class SparseCodingNetwork(HopfieldNetwork):
 
                 # 1) Initial fields: h_j = (1/N) sum_k J[j,k] * state[k]
                 #    If you'd like to keep the 1/N factor, add it here and in the delta‐update below.
-                h = J.dot(state).astype(np.float64)
+                centered_state = self.n - self.f
+                h = J.dot(centered_state).astype(np.float64)
 
                 # 2) Pre‐draw all the random neuron indices
                 picks = np.random.randint(0, N, size=N * k_sweeps)
@@ -693,28 +689,28 @@ import time
 start = time.perf_counter()
 
 # Number of neurons
-neurons = 3000
+neurons = 30000
 # Number of evolution runs
 runs = 10
 # Total memories stored before running
-tot_mem_stored = 50
+tot_mem_stored = 1
 # Memory we want to test the overlap with
-test = 49
+test = 0
 # Coding level of memories
-f = 0.5
+f = None
 
 
-syn_specs1 = {"bf_m": 4, "bf_levels": 30, "bf_alpha": 0.25, "bf_decreasing_levels": True, "bf_beta": 2}
+syn_specs1 = {"bf_m": 4, "bf_levels": 30, "bf_alpha": 0.25, "bf_decreasing_levels": False, "bf_beta": 2}
 syn_specsW = {"hebb_lambda" : 0.98, "hebb_alpha" : 4}
 
-Network1 = HopfieldNetwork(neurons, synapse_type = "Wdecay", syn_specs = syn_specsW, c = 0.1)
+Network1 = HopfieldNetwork(neurons, synapse_type = None, syn_specs = syn_specsW, c = 0.01)
 mems = store_k_memories(Network1, tot_mem_stored, f)
 Network1.init_at_memory(mems[test], 0.0)
 
 overlaps = np.zeros((runs,))
 for i in range(runs):
     Network1.run_async(1, binarized = True)
-    overlaps[i] = Network1.overlap(mems[test], f)
+    overlaps[i] = Network1.overlap(mems[test])
     
 plt.plot(np.arange(0,runs), overlaps)
 
@@ -734,7 +730,7 @@ import time
 start = time.perf_counter()
 
 # Number of neurons
-neurons = 1000
+neurons = 1500
 # Number of evolution runs
 runs = 10
 # Total memories stored before running
@@ -742,14 +738,14 @@ tot_mem_stored = 50
 # Memory we want to test the overlap with
 test = 49
 # Coding level of memories
-f = 0.1
+f = 0.5
 
 
 syn_specs1 = {"bf_m": 4, "bf_levels": 30, "bf_alpha": 0.25, "bf_decreasing_levels": True, "bf_beta": 2}
 syn_specsW = {"hebb_lambda" : 0.98, "hebb_alpha" : 4}
 syn_specsDW = {"DW_r1" : 0.01, "DW_r2" : 1.0, "DW_r3": 0, "DW_C": 1}
 
-Network1 = SparseCodingNetwork(neurons, f, synapse_type = "DoubleW", syn_specs = syn_specsDW, c = None)
+Network1 = SparseCodingNetwork(neurons, f, synapse_type = None, syn_specs = syn_specs1, c = None)
 mems = store_k_memories(Network1, tot_mem_stored, f)
 Network1.init_at_memory(mems[test], 0.0)
 
@@ -769,272 +765,358 @@ print(f"Elapsed: {end - start:.4f} seconds")
 
 # %%
 
-# Plot from Benna and Fusi hopfield network
-
-def overlap_in_time_plot(cat_forgetting, synapse_type, N, c, n_mem, time, noise, n_sweeps, syn_specs, binarized, show_plot = True):
-    '''
-    Inputs:
-        - cat_forgetting: 
-            - True: at each t the network is initialized at the last stored memory
-            - False: at each t the network is initialized at the first stored memory
-        - N: number of neurons of the network you want to work on
-        - n_mem: number of runs, to avoid run specific behaviour
-        - time: number of memories to store
-        - noise: epsilon for corrupted memories
-        - n_sweeps: number fo sweeps to perform in running the dynamics
-        - syn_specs: dictionary of parameters for the specific synapse
-        - show_plot: True/False
-        
-    What it does:
-    Initializes the network at the last stored memory (t-th memory) and 
-    at a noisy version of it [in red], then runs the dynamics and 
-    computes the overlap between network status and original memory.
-    '''
-    
-    # Create where to store overlpas
+def overlap_in_time_plot(
+    cat_forgetting,
+    synapse_type,
+    N,
+    c,
+    n_mem,
+    time,
+    noise,
+    n_sweeps,
+    syn_specs,
+    binarized,
+    f=None,
+    show_plot=True
+):
+    """
+    cat_forgetting: if True, test on the most‐recent (t-th) memory; else on the first memory.
+    synapse_type: "None", "BfLin", "Wdecay", or "DoubleW"
+    N, c: size and connectivity
+    n_mem: how many independent runs
+    time: how many memories to store per run
+    noise: epsilon for corrupted cue
+    n_sweeps: sweeps per test
+    syn_specs: dict of parameters for this synapse
+    binarized: whether to pass binarized=True to run_async
+    f: if None → dense regime; if float→ use sparse coding (0<f<1)
+    """
     overlaps_standard = np.zeros((n_mem, time))
-    overlaps_noise = np.zeros((n_mem, time))
-    
-    for j in range(n_mem):
-        
-        # Create a network
-        Net = HopfieldNetwork(N, synapse_type, syn_specs, c= c)
+    overlaps_noise    = np.zeros((n_mem, time))
 
-        # As suggested by the authors of Bf, before starting to track memories store a number of memories "large compared to n^(2m) to reach steady state"
-        # Before using this evaluate if it is true that that this network is not effected by cathastrophic forgetting
-        if synapse_type == "BfLin":
-            pass
-            #  y = store_k_memories(Net, 2**(2*Net.syn_specs["bf_m"]))
-        
-        # Initialize where to store memories
-        memories = np.zeros((time, Net.N))
-        
-        # Compute overlpas in time
-        for i in range(time):
-            
-            # Store one memory, time t = i
-            memories[i] = store_k_memories(Net, 1)
-            
-            # Provisional placeholder to test either y = i or 1. 
-            # Castophic forgetting or memory lifetime
-            y = 0
-            if cat_forgetting == True:
-                y = i
-            else:
-                y = 1
+    for run_idx in range(n_mem):
+        # pick network class + coding level
+        if f is None and synapse_type != "DoubleW":
+            # dense HopfieldNetwork for None, BfLin, Wdecay
+            Net = HopfieldNetwork(
+                N,
+                synapse_type=(None if synapse_type=="None" else synapse_type),
+                syn_specs=syn_specs,
+                c=c
+            )
+            f_local = None
+        else:
+            # sparse coding (either DoubleW or any type when f given)
+            f_local = f if (f is not None) else 0.5
+            Net = SparseCodingNetwork(
+                N,
+                f_local,
+                synapse_type=(None if synapse_type=="None" else synapse_type),
+                syn_specs=syn_specs,
+                c=c
+            )
 
-            # Calculate overlap for uncorrupted cue
-            Net.init_at_memory(memories[y])
-            Net.run_async(n_sweeps, binarized)
-            overlaps_standard[j,i] = Net.overlap(memories[y])
-            
-            # Calculate overlap for noisy cue
-            Net.init_at_memory(memories[y], noise)
-            Net.run_async(n_sweeps)
-            overlaps_noise[j,i] = Net.overlap(memories[y])
+        if synapse_type == "DoubleW" and ((f == None) or (f==0.5)):
+            store_k_memories(Net, 1, 0.5)
+        # we will need to remember the very first memory if cat_forgetting==False
+        first_memory = None
 
-    if show_plot:      
-        # Plot
-        plt.figure(figsize=(8, 5))
-        x_vals = np.arange(1, time + 1)
-        
         for t in range(time):
-            x = x_vals[t]
-            # Extract overlaps at this time across runs
-            y_std = overlaps_standard[:, t]
-            y_noi = overlaps_noise[:, t]
-            
-            # Sort for a clean vertical line
-            y_std_sorted = np.sort(y_std)
-            y_noi_sorted = np.sort(y_noi)
-            
-            # Plot the vertical line connecting standard overlaps at time t
-            plt.plot(
-                [x] * n_mem, y_std_sorted, color='blue', linestyle='-',
-                linewidth=0.8,
-                alpha=0.6
-            )
-            # Plot the blue square markers at the actual (unsorted) points
-            plt.plot(
-                [x] * n_mem, y_std, marker='s', linestyle='None', color='blue',
-                markersize=2.5,
-                alpha=0.6
-            )
-            
-            # Plot the vertical line connecting noisy overlaps at time t
-            plt.plot([x] * n_mem, y_noi_sorted, color='red', linestyle='-',
-                linewidth=0.8,
-                alpha=0.6
-            )
-            # Plot the red square markers at the actual (unsorted) points
-            plt.plot([x] * n_mem, y_noi, marker='s', linestyle='None', color='red',
-                markersize=2.5,
-                alpha=0.6
-            )
-        
-        plt.xlabel("Number of memories")
+            # generate exactly one new pattern
+            if f_local is None:
+                patt = np.random.choice([-1,1], size=N).astype(np.float32)
+            else:
+                patt = np.zeros(N, dtype=np.float32)
+                k = int(round(f_local * N))
+                idx = np.random.choice(N, size=k, replace=False)
+                patt[idx] = 1
+
+            # store it
+            Net.store_memory(patt, f_local)
+
+            # keep the first memory around
+            if t == 0:
+                first_memory = patt.copy()
+
+            # choose which memory to cue
+            if cat_forgetting:
+                cue = patt           # most‐recent
+            else:
+                cue = first_memory   # always the very first
+
+            # clean test
+            Net.init_at_memory(cue, epsilon=0.0)
+            Net.run_async(n_sweeps, binarized=binarized)
+            if f_local is None:
+                overlaps_standard[run_idx,t] = Net.overlap(cue)
+            else:
+                overlaps_standard[run_idx,t] = Net.overlap(cue, f_local)
+
+            # noisy test
+            Net.init_at_memory(cue, epsilon=noise)
+            Net.run_async(n_sweeps, binarized=binarized)
+            if f_local is None:
+                overlaps_noise[run_idx,t] = Net.overlap(cue)
+            else:
+                overlaps_noise[run_idx,t] = Net.overlap(cue, f_local)
+
+    if show_plot:
+        plt.figure(figsize=(8,5))
+        x = np.arange(1, time+1)
+        for t in range(time):
+            y_std = overlaps_standard[:,t]
+            y_noi = overlaps_noise[:,t]
+            # plot sorted vertical lines + raw points
+            plt.plot([t+1]*n_mem, np.sort(y_std), '-', color='blue', alpha=0.6, lw=0.8)
+            plt.plot([t+1]*n_mem, y_std, 's', color='blue', alpha=0.6, ms=2.5)
+            plt.plot([t+1]*n_mem, np.sort(y_noi), '-', color='red',  alpha=0.6, lw=0.8)
+            plt.plot([t+1]*n_mem, y_noi, 's', color='red', alpha=0.6, ms=2.5)
+
+        plt.xlabel("Stored‐memory index t")
         plt.ylabel("Overlap")
-        plt.ylim([-0.05, 1.05])
-        plt.title(f"Overlap vs. memory index  (blue: ε=0, red: ε={noise:.2f})")
+        plt.ylim(-0.05,1.05)
+        plt.title(f"Overlap of last stored memory vs t  - Weight Decaying synapses")
         plt.show()
 
     return overlaps_standard, overlaps_noise
-        
-syn_specs2 = {"bf_m" : 4, "bf_levels" : 30, "bf_alpha" : 0.25, "bf_decreasing_levels" : True, "bf_beta": 2}
-syn_specs3 = {"hebb_lambda" : 0.99, "hebb_alpha" : 4.0}
+
+
+
+
+syn_specs2 = {"bf_m" : 4, "bf_levels" : 35, "bf_alpha" : 0.25, "bf_decreasing_levels" : True, "bf_beta": 2}
+syn_specs3 = {"hebb_lambda" : 0.995, "hebb_alpha" : 4.0}
 c = None
 
-hold1, hold2 = overlap_in_time_plot(cat_forgetting = False, synapse_type="BfLin", N = 1000, c = c, n_mem = 2, time = 150, noise = 0.25, n_sweeps = 10, 
-                     syn_specs = syn_specs2,  binarized = False, show_plot = True)
+# Ns = [100, 200, 400, 800, 1600, 3500, 7000]
 
+#%%
+syn_specs3 = {"hebb_lambda" : 0.995, "hebb_alpha" : 4.0}
 
-
-
-
-
-#%% 
-# # Calculate max memory lifetime
-
-def mem_lifetime_calc(iterations, synapse_type, N, time, noise, n_sweeps, syn_specs, binarized):
-    '''
-    Calculates the average maximum memory lifetime
-    Inputs:
-        - iterations: number of trials to average over
-        - ... Standard inputs for overlap_in_time_plot
-    '''
-
-    max_t_standard = np.zeros((iterations,))
-    max_t_noise = np.zeros((iterations,))
-
-    for i in range(iterations):
-    
-        overlaps_standard, overlaps_noise = overlap_in_time_plot(False, synapse_type, N, 1, time, 
-                                                                noise, n_sweeps, syn_specs, binarized, False)
-        
-        # Create boolean masks
-        mask_standard = (overlaps_standard > 0.99).any(axis=0)
-        mask_noise = (overlaps_noise > 0.99).any(axis=0)
-
-        # Get indices where mask is true
-        indices_standard = np.where(mask_standard)[0]
-        indices_noise = np.where(mask_noise)[0]
-
-        if indices_standard.size > 0:
-            max_t_standard[i] = indices_standard.max()
-
-        if indices_noise.size > 0:
-            max_t_noise[i] = indices_noise.max()
-
-    return np.mean(max_t_standard), np.mean(max_t_noise)
-
-
-syn_specs2 = {"bf_m" : 4, "bf_levels" : 45, "bf_alpha" : 0.25, "bf_decreasing_levels" : True, "bf_beta": 2}
-syn_specs3 = {"hebb_lambda" : 0.98, "hebb_alpha" : 4.0}
-
-mem_lifetime_calc(10, synapse_type = None, N = 100, time = 30, noise = 0.25, 
-                  n_sweeps = 10, syn_specs = syn_specs2, binarized = False)
-
-
-
-
-
-
-
-# %%  
-# Grid search for optimal parameters for Wdecresing synapses, validation metric being max memory lifetime
-# In particular, trying to find optimal hebb_lambda and hebb_alpha
-
-def gridsearch_mem_lifetime(param_ranges, iterations, synapse_type, N, time, noise, n_sweeps, syn_specs, binarized, plot_heatmap=True):
-    '''
-    Grid search over synapse parameters for memory lifetime.
-    Returns: results array, grids, best_params_dict
-    '''
-
-    # Generate grid points
-    param_names = list(param_ranges.keys())
-    grids = []
-    for param in param_names:
-        n_vals, min_val, max_val = param_ranges[param]
-        grid = np.linspace(min_val, max_val, n_vals)
-        grids.append(grid)
-
-    # Build full meshgrid for 1D or 2D grid search
-    mesh = np.meshgrid(*grids, indexing='ij')
-
-    # Allocate array to store results
-    results = np.zeros_like(mesh[0], dtype=np.float32)
-
-    # Iterate over full parameter grid
-    it = np.nditer(results, flags=['multi_index'], op_flags=['readwrite'])
-    while not it.finished:
-        idx = it.multi_index
-
-        # Build syn_specs for current parameter combination
-        syn_specs_curr = syn_specs.copy()
-        for i, param in enumerate(param_names):
-            value = mesh[i][idx]
-            syn_specs_curr[param] = value
-
-        # Compute lifetime for this configuration
-        avg_std, avg_noi = mem_lifetime_calc(iterations, synapse_type, N, time, noise, n_sweeps, syn_specs_curr, binarized)
-
-        # Store result (you can choose avg_std, avg_noi, or a combination)
-        it[0] = avg_std
-
-        print(f"Params {syn_specs_curr} --> Lifetime {avg_std:.2f}")
-        it.iternext()
-
-    # Find best parameters
-    best_idx = np.unravel_index(np.argmax(results), results.shape)
-    best_params = {}
-    for i, param in enumerate(param_names):
-        best_params[param] = mesh[i][best_idx]
-
-    print("\nBest parameters found:")
-    for k, v in best_params.items():
-        print(f"  {k} = {v}")
-
-    # Plot heatmap if 1D or 2D grid search
-    if plot_heatmap:
-        if len(param_names) == 1:
-            plt.figure(figsize=(6, 4))
-            plt.plot(grids[0], results)
-            plt.xlabel(param_names[0])
-            plt.ylabel("Memory lifetime")
-            plt.title("Grid search result")
-            plt.grid()
-            plt.show()
-
-        elif len(param_names) == 2:
-            plt.figure(figsize=(6, 5))
-            plt.imshow(results, origin='lower', aspect='auto',
-                       extent=(grids[1][0], grids[1][-1], grids[0][0], grids[0][-1]),
-                       cmap='viridis')
-            plt.colorbar(label="Memory lifetime")
-            plt.xlabel(param_names[1])
-            plt.ylabel(param_names[0])
-            plt.title("Grid search result")
-            plt.show()
-
-        else:
-            print("Heatmap plotting supported only for 1D or 2D searches.")
-
-    return results, grids, best_params
-
-
-
-param_ranges = {
-    "hebb_lambda": [5, 0.95, 0.999],
-    "hebb_alpha": [5, 1.0, 10.0]}
-
-results, grids, best_params= gridsearch_mem_lifetime(param_ranges, iterations=5,
-                                          synapse_type="Wdecay", N=200, time=70, noise=0.25,
-                                          n_sweeps=10, syn_specs={}, binarized = False, plot_heatmap=True)
-
-print(best_params)
-
-
+# dense regime DoubleW
+hold1,hold2 = overlap_in_time_plot(
+    cat_forgetting=False,
+    synapse_type=None,
+    N=800,
+    c=None,
+    n_mem=2,
+    time=350,
+    noise=0.25,
+    n_sweeps=10,
+    syn_specs=syn_specs3,
+    binarized=False,
+    f=None,           # uses f=0.5 internally for DoubleW
+    show_plot=True
+)
 
 #%%
 
+syn_specsDW =  {"DW_r1":0.01, "DW_r2":1.0, "DW_r3":0, "DW_C":1.2}
 
+# sparse regime 
+hold3,hold4 = overlap_in_time_plot(
+    cat_forgetting=True,
+    synapse_type="Wdecay",
+    N=800,
+    c=None,
+    n_mem=1,
+    time=2000,
+    noise=0.25,
+    n_sweeps=10,
+    syn_specs=syn_specs3,
+    binarized=False,
+    f=None,            # uses SparseCodingNetwork with f=0.1
+    show_plot=True
+)
+
+
+# %%
+
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mtick
+
+def plot_max_memory_lifetime(
+    Ns,
+    synapse_specs,
+    max_t_dict,
+    threshold,
+    runs=10,
+    iters_per_store=1,
+    coding="dense",
+    f=0.5,
+):
+
+    """
+    For each synapse model and each N in `Ns`, store up to max_t_dict[model][i] memories,
+    measuring after each store whether the *first* memory is still retrievable above `threshold`.
+    Repeat `runs` times and average the “last t above threshold” as the lifetime.
+    Plots lifetime vs N on a log‐x axis for all models, with colored points + interpolated curves.
+    
+    Parameters
+    ----------
+    Ns : list of int
+        Network sizes, in increasing order.
+    synapse_specs : dict
+        e.g. {
+            "None": {},
+            "BfLin": {"bf_m":4, "bf_levels":30, ...},
+            "Wdecay": {"hebb_lambda":0.98, "hebb_alpha":4},
+            "DoubleW": {"DW_r1":0.01, ...},
+        }
+    max_t_dict : dict of lists
+        e.g. {
+          "None":    [100,200,400,800],
+          "BfLin":   [ 50,100,200,400],
+          "Wdecay":  [200,400,800,1600],
+          "DoubleW": [ 50,100,200,400],
+        }
+        Each list must have len == len(Ns).
+    threshold : float
+        Overlap threshold for deeming a memory still retrievable.
+    runs : int
+        Number of independent repeats to average over.
+    iters_per_store : int
+        How many asynchronous‐sweep iterations to run after each new memory is stored.
+    coding : {"dense","sparse"}
+        If "dense", uses HopfieldNetwork for all except DoubleW (which uses SparseCodingNetwork with f=0.5).
+        If "sparse", uses SparseCodingNetwork(N,f,...) for all models.
+    f : float
+        Coding level, only used if coding=="sparse".
+    """
+
+    colors = {
+        "None":    "C0",
+        "BfLin":   "C1",
+        "Wdecay":  "C2",
+        "DoubleW": "C3",
+    }
+
+    display_names = {
+        "None":    "Unbounded Continuous",
+        "BfLin":   "Bidirectional Cascade",
+        "Wdecay":  "Weight Decaying",
+        "DoubleW": "Double Well",
+    }
+
+    fig, ax = plt.subplots(figsize=(8,6))
+    ax.grid(True, linestyle='--', linewidth=0.7, color='lightgray', alpha=0.6)
+
+    for model, specs in synapse_specs.items():
+        # collect lifetimes for each N and run
+        lifetimes = np.zeros((len(Ns), runs), dtype=float)
+
+        for i, N in enumerate(Ns):
+            t_max = max_t_dict[model][i]
+
+            for run in range(runs):
+                # instantiate network
+                if coding=="dense":
+                    if model=="DoubleW":
+                        net = SparseCodingNetwork(N, 0.5,
+                                                  synapse_type="DoubleW",
+                                                  syn_specs=specs[N])
+                        f_local = 0.5
+                    else:
+                        net = HopfieldNetwork(N,
+                                              synapse_type=(None if model=="None" else model),
+                                              syn_specs=specs)
+                        f_local = None
+                else:  # sparse coding
+                    net = SparseCodingNetwork(N, f,
+                                              synapse_type=(None if model=="None" else model),
+                                              syn_specs=specs)
+                    f_local = f
+
+                # pre-generate memories
+                memories = []
+                for _ in range(t_max):
+                    if f_local is None:
+                        patt = np.random.choice([-1,1], size=N).astype(np.float32)
+                    else:
+                        patt = np.zeros(N, dtype=np.float32)
+                        idx = np.random.choice(N, size=int(round(f_local*N)), replace=False)
+                        patt[idx] = 1.0
+                    memories.append(patt)
+
+                # store & test
+                overlap_history = np.zeros(t_max, dtype=float)
+                for t in range(t_max):
+                    net.store_memory(memories[t], f_local)
+                    net.init_at_memory(memories[0], 0.0)
+                    net.run_async(iters_per_store)
+                    overlap_history[t] = net.overlap(memories[0], f_local) \
+                        if f_local is not None else net.overlap(memories[0])
+
+                # record lifetime
+                above = np.where(overlap_history > threshold)[0]
+                lifetimes[i, run] = (above[-1] + 1) if len(above) > 0 else 0
+
+        # compute mean & std dev
+        mean_life = lifetimes.mean(axis=1)
+        std_life = lifetimes.std(axis=1, ddof=0)
+
+        # plot with legend using display_names
+        label = display_names.get(model, model)
+        color = colors[model]
+        ax.scatter(Ns, mean_life, color=color, label=label, zorder=3)
+        N_plot    = np.logspace(np.log10(Ns[0]), np.log10(Ns[-1]), 200)
+        mean_plot = np.interp(N_plot, Ns, mean_life)
+        std_plot  = np.interp(N_plot, Ns, std_life)
+        ax.fill_between(N_plot,
+                        mean_plot - std_plot,
+                        mean_plot + std_plot,
+                        color=color, alpha=0.3, zorder=2)
+        ax.plot(N_plot, mean_plot, color=color, lw=1.5, zorder=4)
+
+    # log scale and custom ticks
+    ax.set_xscale("log")
+    ax.set_xticks(Ns)
+    ax.xaxis.set_major_formatter(mtick.ScalarFormatter())
+    ax.xaxis.set_minor_formatter(mtick.NullFormatter())
+
+    ax.set_xlabel("Network size N")
+    ax.set_ylabel("Max memory lifetime (mean ± std over runs)")
+    ax.legend()
+    fig.tight_layout()
+    plt.show()
+
+
+Ns = [200, 400, 800, 1600, 3500]
+synapse_specs = {
+    "None":   {},
+    "BfLin":  {"bf_m":4, "bf_levels":35, "bf_alpha":0.25,
+               "bf_decreasing_levels":True, "bf_beta":2},
+    "Wdecay": {"hebb_lambda":0.995, "hebb_alpha":4},
+    "DoubleW": {
+        200:  {"DW_r1":0.02, "DW_r2":1.0, "DW_r3":0, "DW_C":1.3},
+        400:  {"DW_r1":0.01, "DW_r2":1.0, "DW_r3":0, "DW_C":1.8},
+        800:  {"DW_r1":0.01, "DW_r2":1.0, "DW_r3":0, "DW_C":1.2},
+        1600: {"DW_r1":0.01, "DW_r2":1.0, "DW_r3":0, "DW_C":0.7},
+        3500: {"DW_r1":0.01, "DW_r2":1.0, "DW_r3":0, "DW_C":0.35},
+    }
+}
+max_t_dict = {
+    "None":    [70, 125, 200 , 350, 650],
+    "BfLin":   [50,  60,  70, 100, 175],
+    "Wdecay":  [50,  70, 120, 160, 200],
+    "DoubleW": [60, 150, 250, 700, 1300],
+}
+threshold = 0.97
+runs = 5
+iters_per_store = 10
+coding = "dense"
+f = 0.5
+
+# Generate the plot
+plot_max_memory_lifetime(
+    Ns,
+    synapse_specs,
+    max_t_dict,
+    threshold=threshold,
+    runs=runs,
+    iters_per_store=iters_per_store,
+    coding=coding,
+    f=f
+)
+
+# %%
